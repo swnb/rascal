@@ -2,7 +2,13 @@ import Foundation
 
 package struct UnavailableOperationJournal: OperationJournal {
     package let isWritable = false
-    package init() {}
+    private let diagnostic: String
+
+    package init(
+        diagnostic: String = "Durable operation journal is unavailable until M3"
+    ) {
+        self.diagnostic = diagnostic
+    }
 
     package func loadOperations() throws -> [JournalOperation] { [] }
     package func admit(_ snapshot: OperationSnapshot, at timestamp: Date) throws -> JournalAdmission {
@@ -16,7 +22,7 @@ package struct UnavailableOperationJournal: OperationJournal {
 
     private func unavailable() -> FileOperationFailure {
         FileOperationFailure(code: .serviceSafeMode,
-                             diagnostic: "Durable operation journal is unavailable until M3",
+                             diagnostic: diagnostic,
                              retryable: false)
     }
 }

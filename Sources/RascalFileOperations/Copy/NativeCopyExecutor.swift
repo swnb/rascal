@@ -174,8 +174,10 @@ package final class NativeCopyExecutor: @unchecked Sendable, OperationExecutor {
         do {
             let key = key(for: context)
             guard let preflight = registry.preflightReceipt(for: key),
-                  preflight.source == context.source,
-                  preflight.destination == destination else {
+                  preflight.source.resolvingSymlinksInPath().standardizedFileURL ==
+                    context.source.resolvingSymlinksInPath().standardizedFileURL,
+                  preflight.destination.resolvingSymlinksInPath().standardizedFileURL ==
+                    destination.resolvingSymlinksInPath().standardizedFileURL else {
                 throw NativeFileError(
                     code: .invariantViolation,
                     systemCode: nil,

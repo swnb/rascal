@@ -555,6 +555,274 @@ Composite identity 至少包含 adapter/version、volume UUID/FSID、device/inod
 
 未完成和recoveryRequired/cleanupRequired/source-retained records不自动清除。`cancelled`只有staging确认不存在时才是可清理终态。普通terminal records保留30天且最多100；Clear只作用于无pending effect/recovery的终态。
 
+### M3 实现前架构审计与基线
+
+2026-07-24 的 M3 实现前审计以 commit
+`af621ec07cbf3af0194a31637a41f3da004abf49` 为唯一基线。GitHub Actions run
+`30066218400`（`swnb/rascal`，`macOS fast lane`）在同一 head SHA 成功；artifact
+`m1-fast-evidence-30066218400` digest 为
+`sha256:d045b1a2a53d2eadcce3929c765105e276f52a6353b408f2763cf78514bddb49`。
+下载后的 `head.txt`/`head-end.txt` 均为该 SHA，`M1-CI-001=PASS`，该证据只证明
+M1/M2 checkpoint 基线可归因，不替代任何 M3 journal、volume 或 crash 场景。
+
+事实：
+
+- `Package.swift` 当前把 `RascalFileOperations` target 的 sources 闭合为
+  `Core/Interfaces/Native/Copy`；若不修订 target，`Journal/Move/Replace/Recovery`
+  不会参与编译，系统 `sqlite3` 也没有显式 linker contract。
+- `OperationJournal`、`FailpointController` 与 `ServiceDependencies` 当前位于
+  `Interfaces/OperationDependencies.swift`，不是原 allowlist 假定的独立
+  `Interfaces/OperationJournal.swift`。
+- `ServiceConfiguration` 当前位于 `Core/PublicTypes.swift`，其公开字段已经足以
+  传入 journal URL；M3 不新增公开配置字段，也不改变公开 service 方法签名。
+- 现有 `OperationJournal.checkpoint` 和 `OperationExecutor.perform` 能表达 M1/M2
+  projection，但不能单独证明逐 destructive effect 的 durable intent、结果和
+  三 ACK 绑定。M3 必须增加 package-internal 子协议/值类型并由 service actor 编排，
+  不得让 executor 持有第二 SQLite connection。
+
+建议及已采纳决策：
+
+- `Package.swift` 仅增加四个 M3 source 目录与 `.linkedLibrary("sqlite3")`；不引入
+  第三方 runtime。
+- `OperationDependencies.swift` 只允许增加 package-internal M3 effect/ACK seam；
+  公开 API 与已冻结的 public Codable envelope schema v1 不变。
+- 系统 SQLite3 作为既定成熟存储引擎，不自研数据库/WAL。实现依据 SQLite 官方
+  WAL、PRAGMA 与 C API 文档：
+  `https://www.sqlite.org/wal.html`、`https://www.sqlite.org/pragma.html`、
+  `https://www.sqlite.org/c3ref/open.html`。`integrity_check` 不覆盖 FK，因此
+  必须另跑 `foreign_key_check`；PRAGMA 设置后必须读取并比较结果，不能假定默认值。
+
+### 接口：`JournalOwnerLease`
+
+职责：在任何 RW SQLite open、migration 或 owner epoch 写入前取得单一进程所有权，
+并以存活 FD 对后续 journal/effect/action 做 fencing。
+
+| 项 | 规范 |
+|---|---|
+| lock path | `<journal-directory>/operations.sqlite.owner.lock`；不得接受调用方任意 URL |
+| open | directory 先 `open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`；lock file 通过该 directory FD 以 `openat(O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600)` 打开并 `fstat` 确认 regular file、link count=1、owner 为当前 uid |
+| primitive | `flock(fd, LOCK_EX|LOCK_NB)`；失败不删除/替换 lock file，不以 SQLite busy timeout 冒充 owner fencing |
+| 生命周期 | lease FD 从 SQLite RW open 前一直持有到 connection/所有 statement 关闭后；helper/CrashProbe child 不继承 FD，spawn 前再次确认 `FD_CLOEXEC` |
+| epoch | 每次成功取得 lease 后生成随机 UUID；只有只读schema/DDL/全量envelope解码通过，且RW connection的migration/integrity/FK及再次全量枚举也通过后，才在首个业务写入前以独立 `BEGIN IMMEDIATE` 插入 `owner_epochs`；任何拒绝路径不得新增epoch或改变恢复集合 |
+| takeover | 只有旧 owner 进程死亡、OS 释放 lock 后才可取得新 lease；新 epoch 不修改旧 epoch 的 intent/result，只通过新的 recovery action 明确认领待检查 effect |
+| stale command | action/effect 的 durable owner epoch 不等于当前 epoch时，普通执行返回无副作用 `controlRejected`，不发 filesystem call；只有当前 epoch新签发且绑定旧 unresolved effect的 recovery action可检查/收敛 |
+| lock 失败 | 可选只读 connection只用于枚举/展示；`isWritable=false`，不跑migration/checkpoint、不创建queue owner、不签发action、不写event |
+
+错误语义：directory/lock identity不可信、lock争用、FD继承检查失败或epoch首事务失败均使
+service-wide safe mode。lock争用不是单operation recovery；不得自动删除任何
+staging、backup、quarantine或source。
+
+### 接口：SQLite journal schema v1
+
+职责：把冻结的公共 envelope v1 与 M3 的内部 durable effect/owner 数据映射到可迁移、
+有FK和唯一约束的单连接 SQLite schema。时间统一存 UTC Unix milliseconds；
+UUID统一用小写 canonical text；URL、identity、request/snapshot/event/failure使用
+带 `envelope_version=1` 的 canonical JSON BLOB。未知 envelope/schema version
+fail closed，不跳过记录。
+
+| 表 | 规范字段/主键 | FK、唯一性与约束 | 写入 owner |
+|---|---|---|---|
+| `journal_meta` | `key TEXT PRIMARY KEY`, `value BLOB NOT NULL` | 至少含 `schema_version=1`、首次创建SQLite版本 | migration transaction |
+| `owner_epochs` | `epoch TEXT PRIMARY KEY`, `pid INTEGER NOT NULL`, `started_ms INTEGER NOT NULL`, `sqlite_version TEXT NOT NULL` | epoch UUID合法；append-only | `JournalOwnerLease`首事务 |
+| `operations` | `operation_id TEXT PRIMARY KEY`, `envelope_version INTEGER NOT NULL`, `kind/state TEXT NOT NULL`, `request_blob/snapshot_blob BLOB NOT NULL`, `submission_ordinal INTEGER NOT NULL UNIQUE`, `latest_durable/latest_emitted/reserved_through INTEGER NOT NULL`, `owner_epoch TEXT NOT NULL`, `created_ms/updated_ms INTEGER NOT NULL`, `terminal_error_blob BLOB`, `partial_flags INTEGER NOT NULL DEFAULT 0` | `owner_epoch → owner_epochs`; `0 <= latest_durable <= latest_emitted <= reserved_through`; kind/state必须可解码 | service actor |
+| `operation_items` | `(operation_id,item_id) PRIMARY KEY`, `item_ordinal INTEGER NOT NULL`, source/destination/identity/state/staging/quarantine/progress/verification/failure columns | `operation_id → operations ON DELETE CASCADE`; `UNIQUE(operation_id,item_ordinal)`；nullable URL不代表effect不存在 | service actor |
+| `operation_receipts` | `(operation_id,item_id) PRIMARY KEY`, `summary_blob`, committed/backup/quarantine identity blobs, `manifest_digest`, `source_cleanup_state`, `receipt_sequence`, `created_ms` | FK到同一item `ON DELETE CASCADE`；commit identity与backup字段首次写入后不可变化；重复summary必须字节相等，唯一允许的更新是已完成quarantine/purge result同事务把`source_cleanup_state`从`pending→complete`并清空已不存在的quarantine URL，禁止反向或换绑对象 | service actor |
+| `operation_effects` | `(operation_id,item_id,effect_id) PRIMARY KEY`, `attempt_id`, `action_id`, `effect_ordinal`, `kind`, `node_id`, `relative_path`, `owner_epoch`, `intent_blob`, `intent_sequence`, `created_ms` | FK到item/epoch；`UNIQUE(operation_id,item_id,effect_ordinal)`；intent immutable；`node_id`只对purge node非空 | service actor |
+| `operation_effect_results` | `(operation_id,item_id,effect_id) PRIMARY KEY`, `status`, `result_identity_blob`, `system_code`, `result_blob`, `result_sequence`, `created_ms` | FK到effect `ON DELETE CASCADE`；status仅`completed/notPerformed/ambiguous`；immutable；重复必须字节相等 | service actor |
+| `operation_events` | `(operation_id,sequence) PRIMARY KEY`, `item_id`, `envelope_version`, `payload_blob`, `created_ms` | FK到operation；append-only；sequence不得超过reservedThrough | service actor |
+| `operation_attempts` | `(operation_id,attempt_id) PRIMARY KEY`, `owner_epoch`, `attempt_ordinal`, `state`, `created_ms/updated_ms` | FK到operation/epoch；ordinal每operation唯一 | service actor |
+| `recovery_action_records` | `(operation_id,action_id) PRIMARY KEY`, `owner_epoch`, `expected_sequence`, `action_blob`, `state`, `created_ms/updated_ms` | FK到operation/epoch；state仅`offered/selected/completed/rejected`；action进入snapshot时以`offered`与当前epoch同事务落盘，选择时只能由同epoch的`offered→selected`；同ActionID payload不可变化 | service actor |
+| `manifest_nodes` | `(operation_id,item_id,node_id) PRIMARY KEY`, `parent_node_id`, `relative_path`, `depth`, `kind`, `identity_blob`, `digest`, `purge_ordinal` | FK到item；relative path规范化且不得绝对/含`..`；`UNIQUE(operation_id,item_id,purge_ordinal)` | verifier，commit前冻结 |
+
+索引至少包括：operation terminal/updated、item operation/order、effect unresolved
+（intent无result）、event operation/sequence、recovery action state、manifest purge order。
+SQLite FK不能跨复合键漏掉item ownership；DDL/migration tests必须用
+`PRAGMA foreign_key_check`证明无孤儿。
+
+v1 canonical DDL不是“同名表/索引存在”检查。实现 MUST从`sqlite_master`读取所有
+`table/index/trigger/view`的name/type/sql，按design随代码冻结的canonical normalized SQL逐项
+精确比较；任何缺失、额外trigger/view、PK/FK/CHECK/UNIQUE/ON DELETE/index列序或partial
+predicate变化都拒绝RW。每个可解码row的规范化列（operation/item/effect kind/state、
+sequence/ordinal、owner/action ID、receipt identity等）MUST与canonical envelope/blob逐字段
+交叉验证，二者不一致即全局safe mode，retention、action选择或恢复均不得只信其中一侧。
+
+事务归组：
+
+1. Admission：operation、全部top-level items、submission ordinal、sequence 1、
+   `.admitted` event同一`BEGIN IMMEDIATE`事务。
+2. Event commit：operation projection、水位、单个event同一事务；未emitted reservation
+   只更新`reserved_through`，不得更新snapshot latest。
+3. Effect intent：immutable effect row及其对应operation/item phase checkpoint同一事务；
+   COMMIT成功后才允许intent ACK。checkpoint不得降低已存的submission ordinal、
+   `latest_durable/latest_emitted/reserved_through`；effect ordinal必须比同item既有最大值大1，
+   intent sequence必须位于已预留范围并大于该effect之前的durable sequence。
+4. Effect result：immutable result row、必要identity与projection checkpoint同一事务；
+   result sequence必须大于其intent sequence且位于已预留范围，`completed`必须有与kind相符的
+   result identity。summary receipt只有在同一事务读取并验证完整effect链、completed result、
+   verification/manifest与既有immutable receipt后才能派生插入；普通checkpoint不得自带或改写
+   receipt。W3 read-back必须同时重读result、receipt和operation/item projection后才允许receipt ACK。
+5. Retention/Clear：先在一个read transaction按下面规则冻结候选ID，再以
+   `BEGIN IMMEDIATE`重新验证全部候选仍是safe terminal且无unresolved effect/action，
+   最后依靠operation-owned CASCADE删除；任一候选变化则整批rollback。
+
+Migration 固定为 `PRAGMA user_version 0 → 1` 的单一原子建库迁移；0但已有未知user table、
+`user_version > 1`、缺失/改变的DDL、未知envelope或迁移事务失败均只读safe mode。
+v1不提供down migration。若journal文件已存在，打开顺序固定为：owner lease →
+只读connection预检`user_version`、canonical DDL全集、所有envelope与normalized/blob一致性，
+并完整枚举operation/effect/action恢复集合（future schema、v0未知表、v1未知/缺失schema、
+未知envelope或无法枚举时在任何RW/PRAGMA/epoch写入前拒绝）→关闭只读connection→
+RW open_v2 → 设置并读取WAL/foreign_keys/FULL → `BEGIN IMMEDIATE` migration
+（仅不存在文件或经只读确认的空v0）→ `integrity_check == ok` →
+`foreign_key_check`零行 → 再次验证canonical DDL、全量decode/enumerate及恢复集合未变化 →
+注册新owner epoch → 允许service mutation。任何一步失败关闭RW connection但保留所有
+数据库/WAL/SHM文件，且不得留下新epoch、checkpoint或action。
+
+### 实体所有权、保留与删除
+
+| 实体 | 创建/更新 | 生命周期 owner | 自动删除条件 | 禁止删除 |
+|---|---|---|---|---|
+| operation及items | service actor | operation | safe terminal且满足retention/Clear，二次事务重验通过 | 非终态、source-retained pending、recovery/cleanupRequired |
+| event/effect/result/receipt/attempt/action | service actor append/checkpoint | parent operation | 只能随已验证可删operation级联 | 单独删除、修剪unresolved历史 |
+| manifest nodes | verifier一次冻结 | item | 只能随operation级联 | purge过程中删除manifest证据 |
+| staging | executor创建，journal立即登记 | item/effect | identity+manifest证明operation-owned且cleanup result durable | unknown identity、unexpected child、parent变化 |
+| quarantine | quarantine effect创建 | item/effect | 全部manifest node purge result及root purge result durable | source/quarantine identity不唯一、unexpected child |
+| replace backup | backup effect创建 | item/effect | `finalizeKnownCommit`明确执行`purgeBackup`且final完整identity重验通过 | commit未知、restore可用、backup identity不唯一 |
+
+普通 safe terminal 以terminal transition的`updated_ms`为龄期：
+29天与恰好30天保留，超过30天（31天样例）可删；此外只保留按
+`updated_ms DESC, operation_id DESC`排序的最新100个safe terminal，101个样例只使最老的
+一个成为候选。年龄与数量条件取并集，但候选仍须无unresolved effect/action；
+pending/unresolved记录不计入100上限。Clear忽略龄期/数量但使用同一safe-terminal谓词。
+operation进入safe terminal后，action record或其他附属证据的更新时间不得刷新该
+terminal transition时间。safe-terminal二次重验必须拒绝任一无result或非`completed`
+result，以及任一`offered/selected` action；`rejected/completed` action只有在对应effect链
+已收敛时才不阻止。Replace receipt可永久保留immutable `backup_url`作为历史证据，但只有
+匹配的`purgeBackup` completed result与`finalizeKnownCommit` completed action同时存在时才
+视为backup已处置并允许普通safe-terminal retention。
+
+### 接口：`DurableEffectJournal`、`DurableEffectExecutor` 与 `CrashACK`
+
+这些是 package-internal M3 seam，不进入公开 contract。
+
+`EffectIntent` 必含：effect ID、operation/item ID、attempt/action ID（可空但来源明确）、
+当前owner epoch、每item严格递增effect ordinal、kind、可选NodeID/relative path、
+输入/目标/parent预期复合identity、manifest digest、创建sequence。完整effect kind集合：
+`stageCommit`、`backupDestination`、`commitReplacement`、`quarantineSource`、
+`purgeQuarantineNode`、`purgeQuarantineRoot`、`rollbackCommittedDestination`、
+`restoreBackup`、`purgeBackup`、`discardStaging`。不得用自由字符串扩展kind。
+
+`EffectResult` 只允许：
+
+- `completed(resultIdentity)`：effect已发生且结果identity唯一；
+- `notPerformed(evidence)`：只读检查证明effect未开始，可用同一effect ID重试；
+- `ambiguous(evidence)`：不能唯一判断，必须recoveryRequired，禁止自动重放。
+
+`SummaryReceipt` 是effect ledger的派生投影，不是executor自报成功：copy/move commit receipt
+要求commit result completed且verification/manifest匹配；replace receipt还要求backup与
+replacement commit链均可解释；cleanup完成要求quarantine root purge completed。commit
+identity与backup一经写入不可变化；跨卷move只允许在purge完成后把cleanup状态单向
+`pending→complete`并清空已不存在的quarantine URL，原始事实仍由append-only effect/result
+保留。
+
+`CrashACK`字段固定为：`scenarioID`、`runNonce`、operation/item/effect ID、
+effect kind、effect ordinal、window、owner epoch、journal commit sequence。
+window仅为：
+
+1. `intentDurableBeforeEffect`：effect intent事务COMMIT并重新读取同一row后；
+2. `effectReturnedBeforeResult`：executor返回后、任何result/receipt写入前；
+3. `resultDurableBeforeNextEffect`：result/receipt事务COMMIT并重新读取后、下一effect前。
+
+CrashProbe driver只接受与启动参数全部字段匹配且本run首次出现的ACK，随后才可
+`SIGKILL`目标PID；stale nonce/epoch/effect、重复ACK、提前ACK或缺字段均使scenario失败。
+ACK是process pipe上的测试控制消息，不写入产品event stream，也不能作为durability事实源。
+
+```mermaid
+sequenceDiagram
+    participant S as FileOperationService actor
+    participant J as DurableEffectJournal
+    participant X as DurableEffectExecutor
+    participant P as CrashProbe driver
+    S->>J: append immutable EffectIntent + phase checkpoint
+    J-->>S: COMMIT + read-back
+    S-->>P: ACK(intentDurableBeforeEffect)
+    S->>X: perform exactly one effect
+    X-->>S: completed/notPerformed/ambiguous + identity evidence
+    S-->>P: ACK(effectReturnedBeforeResult)
+    S->>J: append EffectResult + projection/receipt
+    J-->>S: COMMIT + read-back
+    S-->>P: ACK(resultDurableBeforeNextEffect)
+```
+
+任一journal failure在下一filesystem effect前撤销授权并进入safe mode；executor不得持有
+SQLite connection或在service未给出一个durable `EffectIntent`时执行destructive syscall。
+
+### RecoveryAction 与 quarantine/backup 收敛
+
+| Action | 必要前置 | 允许effect | 成功后置 | 失败/未知 |
+|---|---|---|---|---|
+| `resumeFromVerifiedStage` | stage identity+manifest唯一，未有commit result | `stageCommit`或replace commit chain | receipt durable，随后按source disposition进入barrier | identity变化→recoveryRequired |
+| `retrySourceCleanup` | destination receipt完整；source或quarantine identity唯一 | `quarantineSource`、逐node/root purge | cleanup receipt durable，operation terminal | unexpected child/identity→recoveryRequired |
+| `retainSource` | destination receipt完整，quarantine尚未开始 | 无destructive effect | `completedWithSourceRetained` | quarantine已有intent/result则拒绝 |
+| `rollbackCommittedDestination` | committed destination identity唯一，backup/原source策略允许 | `rollbackCommittedDestination` | item rolledBack，source/backup不误删 | final identity变化→recoveryRequired |
+| `restoreBackup` | backup identity唯一且replace final状态可解释 | `rollbackCommittedDestination`（如需移开new）后`restoreBackup` | old destination在final且identity匹配 | old/new/backup不唯一→recoveryRequired |
+| `finalizeKnownCommit` | final完整identity与commit receipt匹配 | 可选`purgeBackup`，move另走source cleanup | final保留，backup purge receipt durable | backup/final变化→recoveryRequired |
+| `discardKnownStaging` | staging parent/root/node全部匹配登记manifest，commit明确未发生 | 后序`discardStaging` node/root | staging absent且cleanup result durable | ENOENT仅在parent+manifest证明同一owned node已不存在时可completed，否则ambiguous |
+
+每个action必须同时匹配ActionID、expectedSequence与当前owner epoch；旧epoch公开
+`RecoveryCommand`无字段变化，service通过journal中该ActionID的`offered`记录做内部
+fence；选择时还必须在同一事务验证`expectedSequence == operations.latest_durable`。
+接管时不得把旧ActionID重绑新epoch；必须先检查旧effect/result/receipt和normalized/blob
+一致性，再为仍可安全提供的能力签发新ActionID，并在同一checkpoint写入新epoch
+`offered`记录后才暴露到snapshot。每次submit/retry/recover都必须登记
+`operation_attempts`的当前epoch与严格递增attempt ordinal，不能把该表留作未使用装饰。
+
+启动reconciliation MUST联合枚举snapshot、receipt与effect ledger，覆盖
+`committing`、`committedAwaitingCleanup`、`sourceQuarantining`、`cleaningSource`、
+`cleanupRequired`和`recoveryRequired`。若已有destructive intent没有result、result已完成但
+projection/action尚未提交，或replace receipt仍带未处置backup，service必须安全自动收敛，
+或以当前epoch签发至少一个由durable事实可执行的ActionID；不得产生没有available action且
+scheduler也不会选择的永久状态。签发前的只读inspect不能执行filesystem mutation。
+
+Quarantine purge固定按manifest叶到根、`purge_ordinal`顺序执行：
+
+1. 以source parent FD重验source root identity并exclusive same-volume rename到
+   operation-owned quarantine；rename返回后必须从已锚定目标parent FD重读结果并与intent
+   expected object逐字段一致，否则记ambiguous且不得继续purge。
+2. 对每个manifest node以已验证parent FD + `fstatat(AT_SYMLINK_NOFOLLOW)`核对
+   NodeID identity；symlink只删除link本身，hard-link每个directory entry独立ledger。
+3. quarantine rename后且任何unlink前，必须先对整个root做no-follow完整manifest/digest、
+   每个parent NodeID与实际child集合预检；若有manifest外child、内容/digest/type/identity
+   变化或parent不可重验，停止且不得先删除任何已知node。每个node intent必须持久化其
+   frozen parent identity；执行unlink前再从同一parent FD重验。
+4. 每个node一个effect/三ACK；目录后序删除，最后单独删除quarantine root。
+5. `ENOENT`在intent后只能由只读inspect结合parent identity、manifest与既有result判断为
+   `notPerformed`或`completed`；不能仅凭路径不存在推断成功。
+
+Replace backup位于destination同卷operation-owned recovery area。`backupDestination`
+result durable前不得开始replacement commit；replacement commit后不自动删backup。
+replacement commit与summary receipt durable后，item/operation MUST先进入
+`recoveryRequired`并在snapshot暴露同一current owner epoch签发的
+`finalizeKnownCommit`与`restoreBackup`，不得带着未处置backup直接投影为
+`completed`。只有前者以`purgeBackup`收敛后才投影为`completed`，或后者按恢复链
+投影为`rolledBack`。
+只有当前epoch新签发的`finalizeKnownCommit`在重验final/backup identity后通过
+`purgeBackup` effect删除，或`restoreBackup`按上表恢复。任何路径都不得用普通
+FileManager递归删除绕过node/effect ledger。
+
+所有M3恢复准备 MUST能在新进程中只根据journal中的immutable effect
+intent/result、manifest node与summary receipt重建；进程内workspace/registry只可作为
+首次plan的缓存，不能作为restart recovery的授权事实。恢复executor取得既有effect链后，
+必须逐字段复用或重建相同path、object/parent identity与manifest digest；若ledger不足以
+唯一确定staging、quarantine、backup、final或rollback recovery area，action不得执行并
+保持`recoveryRequired`。
+
+`resumeFromVerifiedStage`、`retainSource`与`discardKnownStaging`不得在重启后重新plan或依赖
+进程内workspace：staging/quarantine尚未开始的事实、operation-owned路径、parent/object
+identity及manifest必须在首次提供action前durable登记。若staging cancel发生在`stageCommit`
+intent之前，也必须已有独立durable staging ownership/manifest事实；否则不得提供
+`discardKnownStaging`。真实operation在W1/W2/W3重启后的action可达性是M3 mandatory，
+合成单effect harness只能验证ACK协议，不能替代move/replace状态机恢复。
+
 ## Error and UI Model
 
 Typed error envelope 包含 code、operation/item、phase、underlying errno/system diagnostic、retryability、safe actions、identity evidence摘要。至少支持既定十类错误，并增加 validation、featureDisabled、controlRejected、decisionExpired、invariantViolation 与 serviceSafeMode；原始路径/系统错误在 UI 展示前做必要脱敏，但 journal 保留本机诊断。
@@ -708,15 +976,23 @@ M2仅允许窄constructor/event adapter与既有copy入口替换，不允许结�
 
 ### M3 allowlist
 
+- `Package.swift`（仅把`Journal/Move/Replace/Recovery`纳入既有library target，并链接系统`sqlite3`；不得增加第三方依赖或改变public product）
 - `Sources/RascalFileOperations/Journal/**`、`Move/**`、`Replace/**`、`Recovery/**`
-- `Sources/RascalFileOperations/Core/FileOperationService.swift`、`Core/ServiceConfiguration.swift`（仅把default live factory从unavailable placeholder接到SQLite，并保持公共签名不变）
-- `Sources/RascalFileOperations/Interfaces/OperationJournal.swift`、`Interfaces/UnavailableOperationJournal.swift`（仅wiring/conformance seam；不得改公共contract）
+- `Sources/RascalFileOperations/Core/FileOperationService.swift`（逐effect durable编排及把default live factory从unavailable placeholder接到SQLite；保持公共签名不变）
+- `Sources/RascalFileOperations/Copy/NativeCopyExecutor.swift`（仅修复M3真实restart/replace探针揭示的preflight URL等价比较：身份授权仍由既有stable identity重验，禁止扩改copy算法）
+- `Sources/RascalFileOperations/Interfaces/OperationDependencies.swift`（仅增加package-internal `DurableEffectJournal`/executor/ACK seam、owner epoch读取与默认no-op兼容；不得改公共contract）
+- `Sources/RascalFileOperations/Interfaces/DurableOperationJournal.swift`、`Interfaces/DurableEffectExecution.swift`（新增package-internal seam）
+- `Sources/RascalFileOperations/Interfaces/UnavailableOperationJournal.swift`（仅wiring/conformance seam）
+- `Sources/RascalFileOperations/TestSupport/TestSupport.swift`（仅M3 effect/ACK/journal fake与确定性fault support）
 - `Sources/FileOpsCrashProbe/**`
 - `Tests/RascalFileOperationsTests/Journal/**`、`Move/**`、`Replace/**`、`Recovery/**`
 - `Tests/RascalFileOperationsIntegrationTests/Crash/**`、`Move/**`、`Replace/**`
-- `Scripts/verification/m3-crash-matrix.sh`、`m3-corrupt-journal.sh`、`m3-apfs-cross-volume-move.sh`
+- `Tests/RascalFileOperationsIntegrationTests/ServiceIntegrationTests.swift`、`EventStreamIntegrationTests.swift`（仅M3 SQLite/restart/epoch/effect ACK回归；不得改冻结M1/M2 scenario语义）
+- `Scripts/verification/m3-crash-matrix.sh`、`m3-corrupt-journal.sh`、`m3-apfs-cross-volume-move.sh`、`m3-ui-disabled.sh`、`m3-total-gate.sh`
 
-M3不修改FinderTwo UI或Package公共contract；若M1 target skeleton不足，停止并回到主Codex修订allowlist。
+M3不修改FinderTwo UI或Package公共contract，也不改`PublicTypes.swift`中的公开case/字段。
+`ServiceConfiguration.journalURL`已经存在，故不创建虚假的`Core/ServiceConfiguration.swift`。
+若上述package-internal seam仍不足，停止并回到主Codex修订allowlist。
 
 ### M4 allowlist
 
@@ -815,13 +1091,17 @@ Mandatory scenario被 skip即 milestone FAIL；environment preflight缺失直接
 | M2-EVIDENCE-001 | evidence | M2 mandatory | 每个M2 lane首尾HEAD/status/diff一致；总manifest覆盖全部M2 mandatory ID且skip清单为空 | 4.7c |
 | M2-CSAPFS-001 | capability | M8 deferred-disabled | M2只证明runtime/UI disabled与无fallback；M8转mandatory | 4.6 |
 | M2-EXFAT-001 | capability | M8 deferred-disabled | M2只证明runtime/UI disabled与无fallback；M8转mandatory | 4.6 |
+| M3-STATIC-ALLOWLIST-001 | static | M3 mandatory | 当前HEAD全部改动只位于冻结M3 allowlist，FinderTwo UI production source无改动 | 6.8, 6.9 |
+| M3-OPENSPEC-001 | openspec | M3 mandatory | 当前change strict validate成功且M3 task/evidence归因一致 | 6.9 |
+| M3-UNIT-FAULT-001 | unit/fault | M3 mandatory | 全量Swift测试零failure；本机被跳过的双卷用例必须在同一父bundle APFS child逐例零skip重放 | 5.5, 6.6, 6.9 |
+| M3-BUILD-COMPAT-001 | build | M3 mandatory | 当前production source在release配置完整构建成功 | 6.9 |
 | M3-JRN-001 | journal/process | M3 mandatory | PRAGMA、version、owner lock、second process拒绝、SIGKILL后接管全过 | 5.1, 5.5 |
 | M3-CORRUPT-001 | journal | M3 mandatory | sqlite/wal/shm截断/损坏不触发自动mutation，进入safe mode/recovery | 5.3, 5.5 |
 | M3-MOVE-001 | volume/fault | M3 mandatory | SHA-256/manifest→commit receipt→cancel barrier→quarantine顺序可证 | 6.1-6.3 |
 | M3-CLEAN-001 | crash | M3 mandatory | quarantine竞态与第N node purge各三ACK窗口；destination始终完整 | 6.3, 6.7 |
 | M3-REPLACE-001 | fault/crash | M3 mandatory | copy/move source disposition、old/new完整副本、backup/commit effect ledger全过 | 6.4, 6.7 |
 | M3-CRASH-001 | crash | M3 mandatory | 每个destructive effect三ACK，filesystem predicates与重复action全过 | 5.4, 6.7 |
-| M3-UI-DISABLED-001 | release/UI | M3 mandatory | 正式build的move/replace无service submission、无legacy fallback且磁盘不变 | 6.8, 6.9 |
+| M3-UI-DISABLED-001 | release/UI/static | M3 mandatory | 当前签名debug-default/release build中paste-cut、list/icon drag move、pane-to-pane move、Drop Stack move与FileOps replace conflict全部无M3 service submission、无legacy enqueue/effect，完整fixture树与SQLite operation row count前后不变；positive-entry inventory精确命中 | 6.8, 6.9 |
 | M4-P0-001 | full safety | M4 mandatory | final partial、pre-trash、pre-verify source mutation三P0均有回归且关闭 | 7.4, 7.7 |
 | M4-SINGLE-001 | trace/static | M4 mandatory | 每用户动作一个ID/engine/final commit；旧TransferQueue mutation=0 | 7.5 |
 | M4-UI-001 | UI integration | M4 mandatory | ID cancel、decision、typed error、partial/recovery/source-retained、refresh全过 | 7.2, 7.6 |
@@ -829,6 +1109,76 @@ Mandatory scenario被 skip即 milestone FAIL；environment preflight缺失直接
 | M4-REMOTE-001 | capability | M8 deferred-disabled | SMB/File Provider/iCloud/SFTP/external volume写均disabled且无fallback | 7.7 |
 
 `deferred-disabled`不是skip或pass；它的binary gate是runtime capability disabled、所有UI/command给出明确原因、dynamic trace无legacy/data-only fallback。到标注里程碑后才转为mandatory实测。
+
+### M3 精确 binding 与 crash 子场景
+
+M3聚合ID不得由总lane退出码或常量直接写PASS。每个下列binding必须有
+`started=1, passed=1, failed=0, skipped=0`，missing/extra/unknown/duplicate均使
+`m3-total-gate`失败。M3环境preflight至少证明：journal位于本地APFS；cross-volume
+source/destination为两个mounted且UUID不同的APFS；quarantine与source UUID相同；
+replace recovery area与destination UUID相同；执行的是production
+`renameatx_np`/`unlinkat`路径而非fake。macOS 13 runtime当前若不可用，不得以当前OS
+冒充；M3只能给出当前OS process-crash Go，macOS 13能力继续disabled并作为明确残余风险，
+到M8 release gate前必须补齐。
+
+Journal/process固定bindings：
+
+| Stable sub-ID | 必须证明 |
+|---|---|
+| `M3-JRN-PRAGMA-001` | 每次connection实际读取WAL、foreign_keys=1、synchronous=2及sqlite版本 |
+| `M3-JRN-SCHEMA-001` | 规范性DDL、PK/FK/CHECK/UNIQUE/index与v0→v1 migration；future/unknown拒绝 |
+| `M3-JRN-LOCK-001` | 第二进程RW拒绝、无第二queue/sequence/effect owner |
+| `M3-JRN-TAKEOVER-001` | owner SIGKILL释放lock，新epoch接管；旧epoch action零filesystem effect且`controlRejected` |
+| `M3-JRN-RETENTION-001` | 29/30/31天、99/100/101、terminal/unresolved混排及Clear二次重验 |
+| `M3-JRN-EVENT-001` | admission、reservation gap、paged replay、unknown envelope与restart sequence不复用 |
+| `M3-CORRUPT-MAIN-001` | 主sqlite截断/bit corruption进入全局safe mode，用户对象零mutation |
+| `M3-CORRUPT-WAL-001` | 保留同一恢复集合时wal损坏/截断fail closed，不删wal/shm或用户对象 |
+| `M3-CORRUPT-SHM-001` | shm异常或无法建立时fail closed；不把只复制main的结果记pass |
+
+Crash effect code与stable ID固定如下；每个effect必须运行三个窗口
+`W1=intentDurableBeforeEffect`、`W2=effectReturnedBeforeResult`、
+`W3=resultDurableBeforeNextEffect`，ID格式严格为
+`M3-CRASH-<CODE>-<W1|W2|W3>-001`：
+
+| CODE | Effect kind | 必要场景/最低filesystem谓词 |
+|---|---|---|
+| `COMMIT` | `stageCommit` | final absent或完整；source完整；stage有ledger或已提交identity |
+| `BACKUP` | `backupDestination` | old位于final或registered backup且完整；new未以partial暴露 |
+| `REPLCOMMIT` | `commitReplacement` | old/new至少一个完整副本位于final/backup/registered stage |
+| `QUAR` | `quarantineSource` | destination完整；source位于原路径或registered quarantine且完整 |
+| `QPURGENODE` | `purgeQuarantineNode` | destination完整；只删除匹配NodeID，无unexpected child deletion |
+| `QPURGEROOT` | `purgeQuarantineRoot` | destination完整；root只在全部node result durable后删除 |
+| `ROLLBACK` | `rollbackCommittedDestination` | 不覆盖identity已变化的final；source/backup保持可解释 |
+| `RESTORE` | `restoreBackup` | old/new至少一个完整，backup identity变化时零mutation |
+| `BACKUPPURGE` | `purgeBackup` | final完整且receipt匹配；未知backup不删除 |
+| `STAGEDISCARD` | `discardStaging` | final未提交；只删除manifest匹配的owned stage node/root |
+
+因此crash全集固定为30个子ID，不能因operation未产生某effect而skip；driver必须为该effect
+建立独立scenario。每个子ID保存command、run nonce、精确ACK、driver PID/target PID、
+SIGKILL status、重启event/effect/journal dump、before/after filesystem manifest、
+syscall/effect counter与重复recovery后的counter。`M3-CRASH-001`仅在30/30子ID通过后聚合。
+
+Move/replace/fault bindings至少包括：
+
+| Stable sub-ID | 必须证明 |
+|---|---|
+| `M3-MOVE-POLICY-001` | caller structural被无条件提升SHA-256，逐regular file及canonical tree digest均匹配 |
+| `M3-MOVE-ORDER-001` | verify→commit result/summary receipt→cancel barrier→quarantine→node/root purge顺序 |
+| `M3-MOVE-BARRIER-001` | barrier cancel产生`completedWithSourceRetained`且无quarantine intent |
+| `M3-CLEAN-IDENTITY-001` | source/quarantine/node/parent竞态、unexpected child、symlink/hardlink、ENOENT均保守停止 |
+| `M3-REPLACE-BACKUP-001` | backup/commit/finalize/restore的old/new/backup identity与source disposition矩阵 |
+| `M3-RECOVERY-ACTION-001` | 七个ActionID+expectedSequence+epoch前置、重复调用及stale action |
+
+`M3-UI-DISABLED-001`必须绑定已有positive entry `ENTRY-PASTE`、
+`ENTRY-LIST-DRAG`、`ENTRY-ICON-DRAG`、`ENTRY-PANE-MOVE`及Drop Stack
+`moveAllHere`、`FileOps.transfer` replace conflict；debug-default与release(env=1也拒绝)
+都运行production-source动态probe。删掉入口、只做静态零命中、只看legacy gate或只看
+SQLite row count均不能单独记pass。
+
+M3父bundle沿用M2 finalization规则：直接哈希每个child `evidence.sha256`，首尾
+HEAD/status/diff/untracked内容一致，scenario聚合与整包manifest立即复验完成后最后写
+`lane.exit=0`；signal中止或任一mandatory skip时非零或不生成。主Codex亲跑最终门，
+独立verifier使用不同scratch/journal/sandbox。
 
 Metadata fixture每个字段只能得到：before/after相等的`preserved`、带精确decision的`unsupported/unknown`、或typed failure。通用xattr不能替代Finder tags/FinderInfo/resource fork；logical bytes不能替代sparse allocated blocks。
 

@@ -378,7 +378,10 @@ public struct ServiceConfiguration: Sendable {
     public static let `default` = ServiceConfiguration(journalURL: defaultJournalURL)
     public let journalURL: URL
 
-    private init(journalURL: URL) { self.journalURL = journalURL }
+    /// Package-visible for attributed verification probes and composition
+    /// roots; applications still use `.default` unless they explicitly own a
+    /// separate journal location.
+    package init(journalURL: URL) { self.journalURL = journalURL }
 
     private static var defaultJournalURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

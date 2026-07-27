@@ -1,6 +1,6 @@
 import Foundation
 
-package enum RecoveryEffectResult: String, Sendable {
+package enum RecoveryEffectResult: String, Codable, Sendable {
     case completed
     /// A read-only inspector durably proved that the write-ahead intent did
     /// not reach the external effect. The same effect ID may be retried after
@@ -11,7 +11,7 @@ package enum RecoveryEffectResult: String, Sendable {
 /// Durable per-item write-ahead record for a recovery filesystem effect.
 /// `result == nil` means the intent is durable but the outcome must be
 /// inspected before the same stable effect ID may be attempted again.
-package struct RecoveryEffectAttempt: Sendable, Equatable {
+package struct RecoveryEffectAttempt: Codable, Sendable, Equatable {
     package let effectID: UUID
     package let effect: ExecutionRecoveryEffect
     package var result: RecoveryEffectResult?
@@ -28,7 +28,7 @@ package struct RecoveryEffectAttempt: Sendable, Equatable {
 /// it. The optional remains for journal schema compatibility, but adapters
 /// must reject `nil` when applying a decision to any concrete item, including
 /// a `remainingItems` policy projected onto the next item.
-package struct ResolvedOperationDecision: Sendable, Equatable {
+package struct ResolvedOperationDecision: Codable, Sendable, Equatable {
     package let decision: OperationDecision
     package let identityDigest: String?
 
@@ -38,7 +38,7 @@ package struct ResolvedOperationDecision: Sendable, Equatable {
     }
 }
 
-package struct JournalOperation: Sendable {
+package struct JournalOperation: Codable, Sendable {
     package var snapshot: OperationSnapshot
     package var submissionOrdinal: UInt64
     package var latestDurableSequence: EventSequence
@@ -132,7 +132,13 @@ package enum Failpoint: String, Sendable {
     case decisionResolved
     case preflightReadyBeforePlan
     case stagingStarted
+    /// Deterministic mutation window after verification succeeds but before
+    /// any destructive effect intent is prepared or persisted.
+    case verificationReadyBeforeEffects
     case committedAwaitingCleanup
+    /// Source identity inspection succeeded, but no quarantine intent has yet
+    /// been prepared or persisted.
+    case sourceCleanupInspectedBeforeQuarantineIntent
     case recoveryRequired
     case phaseBeganBeforeAuthorization
     case recoveryEffectIntentPersisted
@@ -145,6 +151,11 @@ package enum Failpoint: String, Sendable {
 
 package protocol FailpointController: Sendable {
     func hit(_ point: Failpoint, operationID: OperationID) async
+    func hit(_ acknowledgement: CrashAcknowledgement) async
+}
+
+package extension FailpointController {
+    func hit(_ acknowledgement: CrashAcknowledgement) async {}
 }
 
 package enum ServiceDiagnostic: Sendable, Equatable {
@@ -398,7 +409,7 @@ package enum ExecutionSourceInspection: Sendable {
     case unknown(FileOperationFailure)
 }
 
-package enum ExecutionRecoveryEffect: String, Sendable {
+package enum ExecutionRecoveryEffect: String, Codable, Sendable {
     case rollbackCommittedDestination
     case finalizeKnownCommit
     case cleanupSource
@@ -432,12 +443,14 @@ package struct ServiceDependencies: Sendable {
     package let diagnostics: any ServiceDiagnosticSink
     package let replayPageSize: Int
     package let liveBufferLimit: Int
+    package let crashScenario: CrashScenarioContext?
 
     package init(journal: any OperationJournal, fileSystem: any FileSystemAdapter,
                  clock: any OperationClock, ids: any OperationIDGenerator,
                  digest: any DigestProvider, failpoints: any FailpointController,
                  executor: any OperationExecutor, diagnostics: any ServiceDiagnosticSink,
-                 replayPageSize: Int = 32, liveBufferLimit: Int = 64) {
+                 replayPageSize: Int = 32, liveBufferLimit: Int = 64,
+                 crashScenario: CrashScenarioContext? = nil) {
         self.journal = journal
         self.fileSystem = fileSystem
         self.clock = clock
@@ -448,5 +461,6 @@ package struct ServiceDependencies: Sendable {
         self.diagnostics = diagnostics
         self.replayPageSize = max(1, replayPageSize)
         self.liveBufferLimit = max(1, liveBufferLimit)
+        self.crashScenario = crashScenario
     }
 }

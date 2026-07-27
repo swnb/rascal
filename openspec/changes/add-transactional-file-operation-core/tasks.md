@@ -81,23 +81,31 @@
 
 ## 5. M3 — SQLite Journal 与恢复基础
 
-- [ ] 5.1 在M3 allowlist内实现journal目录process-exclusive advisory lock、owner epoch、单actor-owned SQLite connection，逐连接验证WAL/foreign_keys/FULL并记录版本；schema含operations/items/summary receipts/1:N effects/events/attempts/recovery actions与migration，并把default live journal factory从M1 unavailable placeholder显式接线到SQLite。
-- [ ] 5.2 实现append-only intent/pre-effect/effect-result/summary receipt协议、durable event与sequence reservation，以及29/30/31天、99/100/101终态/unresolved混排保留和pending-safe Clear。
-- [ ] 5.3 把sqlite/wal/shm作为恢复集合，启动运行migration/integrity/foreign-key检查；无法枚举operations或取得owner lock时进入service-wide只读safe mode且不自动删除任何对象。
-- [ ] 5.4 为每个destructive effect实现intent后/effect前、effect返回后/receipt前、receipt durable后/下一effect前三个稳定ACK；CrashProbe driver收到精确ACK后才SIGKILL，每场景独立journal/sandbox。
-- [ ] 5.5 用Unit/Fault/process tests覆盖journal open/write/fsync/migration/retention/corruption、event replay、tokenized action幂等、retry effect幂等、second-process lock拒绝、owner SIGKILL后接管和旧epoch action拒绝。
+- 2026-07-24 M3归因基线：分支`feat/transactional-file-ops-m3`、HEAD=`af621ec07cbf3af0194a31637a41f3da004abf49`；`swnb/rascal` Actions run `30066218400`在同一head成功，artifact `m1-fast-evidence-30066218400` digest=`sha256:d045b1a2a53d2eadcce3929c765105e276f52a6353b408f2763cf78514bddb49`，下载核验`head.txt/head-end.txt`一致且`M1-CI-001=PASS`。该run只作为M3开始前基线，不计任何M3场景PASS。
+- 2026-07-24 实现前架构审计发现并已在design/spec关闭五类P0规划缺口：真实Package/interface allowlist、规范性SQLite schema/migration/ownership、owner lease/epoch fencing、逐effect/三ACK状态机、RecoveryAction/quarantine/backup删除语义及30个crash子ID。生产实现只能按这些修订后的合同进行。
+- 2026-07-24 首轮独立M3审查判No-Go；在继续实现前已把以下缺口回填同一change：canonical DDL与normalized/blob交叉验证、未知envelope拒绝前零epoch写入、sequence/ordinal/result/receipt事务不变量、terminal retention与backup purge语义、expectedSequence/attempt约束、启动期真实operation action可达性、post-rename/quarantine全manifest/parent/ENOENT fail-closed，以及父总门必须解析冻结子ID而非聚合退出码。首轮失败与旧standalone PASS只作历史证据，不关闭任何task。
+- [x] 5.1 按design的`JournalOwnerLease`与SQLite schema v1接口在M3 allowlist内实现directory-FD anchored process-exclusive lock、`CLOEXEC`、owner epoch、单actor-owned SQLite connection，逐连接设置后读取验证WAL/foreign_keys/FULL并记录版本；实现规范性DDL/v0→v1 migration，把Package target/linker与default live journal factory从M1 unavailable placeholder显式接线到SQLite，公开API不变。
+- [x] 5.2 实现immutable effect intent/result与summary receipt事务、durable event/sequence reservation；按design精确完成29/30/31天、99/100/101 safe-terminal/unresolved混排保留和pending-safe Clear的候选冻结+写事务二次重验。
+- [x] 5.3 把sqlite/wal/shm作为不可拆恢复集合，按owner lease→PRAGMA→migration→integrity→foreign-key→全量decode/enumerate顺序启动；future/unknown schema、无法枚举operations或取得owner lock时进入service-wide只读safe mode且不自动删除数据库文件或任何用户对象。
+- [x] 5.4 实现design冻结的10类destructive effect及字段级`CrashACK`：intent COMMIT/read-back后、effect返回后/result前、result/receipt COMMIT/read-back后三个窗口；CrashProbe driver仅在scenario/run nonce/effect/epoch/sequence精确匹配后SIGKILL，每场景独立journal/sandbox。
+- [x] 5.5 按`M3-JRN-*`/`M3-CORRUPT-*` bindings用Unit/Fault/process tests覆盖journal open/write/fsync/migration/DDL/retention/corruption、event replay、tokenized action与retry effect幂等、second-process lock拒绝、helper FD不继承、owner SIGKILL后接管、旧epoch offered action不可重绑且零effect拒绝，以及新epoch新ActionID重新签发。
+  - 2026-07-24 最终主总门 `20260724T-main-m3-total-r4` 的 journal/corruption child 自校验哈希通过；9个冻结binding全部PASS，覆盖主库、WAL、SHM损坏集合，mandatory skip=0。
 
 ## 6. M3 — Move、Replace 与 Crash Matrix
 
-- [ ] 6.1 实现每个 regular file SHA-256 + canonical tree manifest，跨卷 move无条件提升 effective policy且调用方不可降低。
-- [ ] 6.2 实现跨卷move的staged copy→metadata→verify→commit→durable receipt→`committedAwaitingCleanup`→source同卷exclusive quarantine→manifest purge顺序，并禁止COPYFILE_MOVE。
-- [ ] 6.3 实现barrier cancel的`completedWithSourceRetained`、quarantine intent/result/identity receipt、node-level purge ledger、unexpected child保护、cleanupRequired和幂等cleanup retry；无法安全quarantine时禁用directory/package move。
-- [ ] 6.4 实现同卷move/rename相同journal/receipt/error契约，以及Replace同卷staging、operation-owned recovery area和逐effect backup/commit；standalone/copy replace保留source，move replace receipt后才quarantine。
-- [ ] 6.5 实现snapshot签发的resume/rollback/restore backup/finalize commit/discard known staging/retain source actions；ActionID+expectedSequence command幂等，固定retry只承诺effect幂等，identity不唯一只提供人工recoveryRequired。
-- [ ] 6.6 建立move/replace deterministic fault tests，覆盖journal、backup、rename/commit、committed-awaiting-cleanup cancel、source quarantine竞态、node purge、source/destination mutation和重复action。
-- [ ] 6.7 对backup、commit、source quarantine、每个node purge等destructive effect的三ACK窗口逐一SIGKILL/restart；逐场景断言final永不partial、Replace至少一个完整old/new副本、Move purge阶段destination完整，且重复恢复无二次effect。
-- [ ] 6.8 确认 M3 正式 UI move/replace仍禁用；Core tests通过不得提前打开写能力。
-- [ ] 6.9 主Codex按M3-JRN/CORRUPT/MOVE/CLEAN/REPLACE/CRASH/UI-DISABLED stable IDs运行全部Unit/Fault/Volume/Crash/static/build兼容门，独立reviewers审查filesystem predicates后判Go/No-go并等待用户批准M4。
+- [x] 6.1 复用并扩展M2 manifest实现每个regular file SHA-256 + canonical tree manifest与稳定NodeID/purge ordinal；跨卷move无条件提升effective policy且调用方不可降低，绑定`M3-MOVE-POLICY-001`。
+- [x] 6.2 实现跨卷move的staged copy→metadata→verify→commit effect/result→summary receipt→`committedAwaitingCleanup`→source同卷exclusive quarantine→manifest leaf-to-root purge顺序，并禁止COPYFILE_MOVE；service actor是唯一effect/journal编排owner。
+- [x] 6.3 实现barrier cancel的`completedWithSourceRetained`且无quarantine intent；实现quarantine identity result、每node/root ledger与三ACK、unexpected child/symlink/hardlink/parent/ENOENT保护、cleanupRequired和幂等cleanup retry；无法安全quarantine时禁用directory/package move。
+- [x] 6.4 实现同卷move/rename相同journal/receipt/error契约，以及Replace同卷staging、operation-owned recovery area和独立backup/commit/purgeBackup/restore effects；standalone/copy replace保留source，move replace receipt后才quarantine，backup不得由terminal/Clear隐式删除。
+- [x] 6.5 按design RecoveryAction矩阵实现snapshot签发的resume/rollback/restore backup/finalize commit/discard known staging/retain source；Replace receipt durable后先进入`recoveryRequired`并签发finalize/restore，未处置backup不得投影completed；重启恢复准备只能由durable effect/manifest/receipt重建，不得依赖前一进程workspace；ActionID+expectedSequence+durable owner epoch command幂等，固定retry只承诺effect幂等，identity不唯一只提供人工recoveryRequired。
+- [x] 6.6 按`M3-MOVE-*`/`M3-CLEAN-*`/`M3-REPLACE-*`/`M3-RECOVERY-ACTION-001`建立deterministic fault tests，覆盖journal、backup、rename/commit、barrier cancel、source quarantine/node/root purge、source/destination/backup/stage mutation和重复/stale action。
+- [x] 6.7 对design冻结10类effect × W1/W2/W3共30个stable crash sub-ID逐一SIGKILL/restart；每场景独立真实journal/sandbox/volume，断言final永不partial、Replace至少一个完整old/new副本、Move purge阶段destination完整，重复恢复effect counter不增加且无mandatory skip。
+- [x] 6.8 运行`M3-UI-DISABLED-001`冻结入口/debug-default/release矩阵，确认paste-cut、list/icon drag move、pane-to-pane、Drop Stack及replace conflict无M3 service/legacy effect且fixture树/journal row count不变；不得修改FinderTwo UI或提前打开写能力。
+  - 2026-07-24 同一总门的双APFS child对6个move/cleanup/replace/recovery binding全部PASS；crash child为30/30真实operation、SIGKILL/restart、skip=0；UI child在debug-default/release下12/12入口binding通过，service/legacy/journal rows均为0且fixture不变。
+- [x] 6.9 主Codex按design冻结的M3-JRN/CORRUPT/MOVE/CLEAN/REPLACE/CRASH/UI-DISABLED全集运行Unit/Fault/双APFS Volume/30场景Crash/static/build兼容总门，父bundle逐child绑定且skip=0；停止writer后由独立reviewers审查filesystem predicates、ACK归因与假阳性，再判M3 Go/No-go并在M4前停止。
+  - 2026-07-24 主总门 `20260724T-main-m3-r1` 原始结果为8/8聚合场景、30/30合成effect crash、0 skip，但主Codex按冻结contract复核后判定No-Go：crash lane只运行design明确禁止替代真实状态机的single-effect harness且stable code仍为`SC/BD/CR/...`而非冻结ID；corruption缺WAL/SHM；UI-disabled缺debug-default/release真实入口与fixture/journal零变化；move/replace缺barrier cancel、identity竞态及重启action可达性。该bundle只保留为假阳性历史证据，不关闭5.x/6.x任何task。
+  - 2026-07-24 主Codex假阳性复核在r3后发现并关闭1个P1：driver原先只证明同kind effect存在，未把ACK的exact effectID、itemID、owner epoch、ordinal与窗口journal sequence逐字段回绑恢复后的durable record。补强后先以COMMIT W1/W2/W3定向通过，再运行最终主总门`20260724T-main-m3-total-r4`：51/51 mandatory、30/30真实crash operation、12/12 UI动态binding、0 skip；root与四个child `evidence.sha256`闭合，51个父scenario ID精确且唯一，HEAD/status/diff/untracked content首尾一致。这仍不替代本项要求的独立reviewers；独立审查完成前本项保持未勾选、M3保持No-Go且不进入M4。
+  - 2026-07-27 最终主总门`/tmp/rascal-m3-total-r8`在当前staged/unstaged聚合差异上通过：51/51 mandatory、159项Swift Unit/Fault零failure、本机6项双卷skip在同一父bundle的APFS child逐名6/6重放、30/30真实operation SIGKILL/restart crash、12/12由实际逐入口progress派生的UI binding、mandatory skip=0；main/WAL bit+truncate与SHM anomaly均经service safe mode和恢复集合不变性验证，root及四个child evidence hash闭合，HEAD/status/diff/untracked content首尾一致。独立filesystem、ACK、gate三位reviewer最终均为P0=0/P1=0并同意6.9 Go；仅保留design已冻结到M8的同UID `fstatat`→`renameatx_np`/`unlinkat` syscall间理论TOCTOU P2，不宣称OS级隔离或release-ready。M3在此判Go并停止，未进入M4。
 
 ## 7. M4 — Copy/Move/Replace 主干切换
 

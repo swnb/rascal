@@ -111,6 +111,26 @@ Design中的milestone verification manifest SHALL为每个场景分配稳定ID�
 
 M2总门 SHALL冻结每个stable scenario的精确binding全集及其摘要：实际执行且started/passed各一次、failed/skipped为零的XCTest，或经过哈希校验的动态owner marker/字段级artifact。Missing、extra、unknown或重复binding均须使总门失败；每条binding必须独立计算结果后再聚合scenario，Scenario结果不得由常量或总lane退出码直接写成PASS。`M2-CANCEL-001`必须显式绑定mid-file、mid-tree、metadata前、metadata后与commit前取消。`M2-EVIDENCE-001`只可在全部child lane证据hash通过、M2 event trace与volatile journal dump已生成、嵌套M1 evidence manifest摘要被父bundle绑定，且总门HEAD/status/diff/untracked内容首尾一致后生成。父bundle的整包manifest MUST直接包含每个child `evidence.sha256`文件；成功`lane.exit=0`只能在scenario聚合、源码结束态比较、整包manifest生成与立即复验全部成功之后写入。总门被signal中止、子lane未完成或finalization未就绪时，`lane.exit`必须为非零或不生成，绝不可写成0。Release/route/deferred动态probe必须显式关闭bridge alerts，以独立process group和硬超时运行并在wrapper收到INT/TERM时回收全部子进程；任一modal或超时均为gate failure。Release-disabled证据必须以任何枚举错误都会失败的方式比较六个fixture完整树，真实ENOSPC证据必须证明native copy syscall收到kernel `ENOSPC`。
 
+M3总门 SHALL使用design冻结的journal/process bindings、move/replace/recovery bindings及
+10类destructive effect × 3 ACK窗口共30个不可复用crash sub-ID，并沿用相同的
+missing/extra/unknown/duplicate/mandatory-skip失败规则。每个crash ACK必须绑定本run nonce、
+operation/item/effect、kind/ordinal/window、owner epoch和journal sequence；只在intent/result
+事务COMMIT后read-back成功的窗口发送durable ACK。M3真实volume preflight必须证明cross-volume
+source/destination是两个UUID不同的mounted APFS、quarantine与source同卷、replace recovery
+area与destination同卷，并记录实际rename/unlink effect counter。
+父总门 MUST解析并逐项验证design冻结的9个journal/corruption、6个move/replace/recovery及
+30个crash exact sub-ID的child manifests；不能仅凭4个child退出码或8个聚合ID写PASS。
+每个实际XCTest/process/dynamic entry的started/passed/failed/skipped必须从原始结果计算，
+全局和逐binding `skipped=0`，不得硬编码摘要。Crash code只能使用
+`COMMIT/BACKUP/REPLCOMMIT/QUAR/QPURGENODE/QPURGEROOT/ROLLBACK/RESTORE/BACKUPPURGE/STAGEDISCARD`。
+最终化时再次验证child文件集合与冻结列表完全一致并运行每个`evidence.sha256`，再生成root hash。
+
+`M3-UI-DISABLED-001` SHALL在当前签名debug-default与release（包括注入legacy/M2同名env）
+对paste-cut、list/icon drag move、pane-to-pane move、Drop Stack move及replace conflict入口
+逐一动态执行；每个入口必须保持完整fixture tree与SQLite operation row count不变、
+M3 service submission=0、legacy enqueue/effect=0，并由positive-entry inventory证明入口未被
+删除。仅静态零命中、仅legacy gate拒绝、仅journal无row或独立harness均不得单独记PASS。
+
 #### Scenario: ExFAT 在 M2 尚未建立 Lane
 - **WHEN** M2 manifest把ExFAT标为M8 deferred-disabled
 - **THEN** M2不运行一个伪skip测试，但必须证明ExFAT写能力未启用；到M8该场景转为mandatory后环境缺失即失败

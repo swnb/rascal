@@ -4,6 +4,51 @@ import XCTest
 import RascalFileOperationsTestSupport
 
 final class ServiceIntegrationTests: XCTestCase {
+    func testM3FormalMoveAndReplaceGraphRemainsReadOnlyAndAdmitsNoRows() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rascal-m3-ui-disabled-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = try SQLiteOperationJournal(
+            url: directory.appendingPathComponent("operations.sqlite")
+        )
+        let service = try FileOperationService(
+            dependencies: ServiceDependencies(
+                journal: journal,
+                fileSystem: UnavailableFileSystemAdapter(),
+                clock: SystemOperationClock(),
+                ids: RandomOperationIDGenerator(),
+                digest: NoopDigestProvider(),
+                failpoints: NoopFailpointController(),
+                executor: UnavailableExecutor(),
+                diagnostics: NoopDiagnosticSink()
+            ),
+            forceReadOnly: true
+        )
+        let source = directory.appendingPathComponent("source")
+        let destination = directory.appendingPathComponent("destination")
+        for kind in [OperationKind.move, .replace] {
+            do {
+                _ = try await service.submit(OperationRequest(
+                    kind: kind,
+                    sources: [source],
+                    destination: destination,
+                    destinationMode: .exact,
+                    conflictPolicy: .replace
+                ))
+                XCTFail("formal M3 \(kind) graph unexpectedly admitted an operation")
+            } catch let failure as FileOperationFailure {
+                XCTAssertEqual(failure.code, .serviceSafeMode)
+            }
+        }
+        XCTAssertEqual(try journal.loadOperations().count, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     func testDefaultSafeModeValidatesBeforeRefusingAndCreatesNoOperation() async throws {
         let production = try FileOperationService()
         await assertFailure(.validation) {

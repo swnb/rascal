@@ -30,6 +30,46 @@ private struct ManagedItem {
     }
 }
 
+private extension RecoveryAction {
+    func reissued(actionID: UUID, expectedSequence: EventSequence) -> RecoveryAction {
+        let replacement = RecoveryCommand(
+            actionID: actionID,
+            expectedSequence: expectedSequence
+        )
+        switch self {
+        case .resumeFromVerifiedStage: return .resumeFromVerifiedStage(replacement)
+        case .retrySourceCleanup: return .retrySourceCleanup(replacement)
+        case .retainSource: return .retainSource(replacement)
+        case .rollbackCommittedDestination: return .rollbackCommittedDestination(replacement)
+        case .restoreBackup: return .restoreBackup(replacement)
+        case .finalizeKnownCommit: return .finalizeKnownCommit(replacement)
+        case .discardKnownStaging: return .discardKnownStaging(replacement)
+        }
+    }
+}
+
+private extension OperationSnapshot {
+    func replacingRecoveryActions(_ actions: [RecoveryAction]) -> OperationSnapshot {
+        OperationSnapshot(
+            schemaVersion: schemaVersion,
+            id: id,
+            kind: kind,
+            state: state,
+            latestSequence: latestSequence,
+            request: request,
+            effectiveMetadataPolicy: effectiveMetadataPolicy,
+            effectiveVerificationPolicy: effectiveVerificationPolicy,
+            progress: progress,
+            items: items,
+            pendingDecision: pendingDecision,
+            terminalFailure: terminalFailure,
+            availableActions: actions,
+            hasPartialCommit: hasPartialCommit,
+            sourceRetained: sourceRetained
+        )
+    }
+}
+
 private struct ManagedOperation {
     var id: OperationID
     var request: OperationRequest
@@ -136,14 +176,35 @@ private struct ManagedOperation {
             return true
         }
         return items.contains { item in
-            item.state == .cleaningSource &&
-                !hasResolvedRecoveryEffect(for: item.id, effect: .cleanupSource)
+            // Both states are externally effectful, even when the ledger
+            // already contains a completed result. A crash can occur before
+            // the receipt/item/operation projection catches up, so startup
+            // must always inspect and converge them.
+            [.sourceQuarantining, .cleaningSource].contains(item.state) ||
+                (
+                    item.state == .committedAwaitingCleanup &&
+                        item.receipt?.sourceCleanupPending == true
+                )
         }
     }
 
     var hasPendingStagingRecovery: Bool {
         availableActions.contains {
             if case .discardKnownStaging = $0 { return true }
+            return false
+        }
+    }
+
+    /// A plain failed attempt remains eligible for the public tokenless
+    /// `retry(OperationID)` contract. Its single resume capability is durable
+    /// replay metadata, not evidence of an ambiguous external effect. Every
+    /// other offered action represents recovery work that must exclude normal
+    /// admission and scheduling.
+    var hasExclusiveRecoveryCapabilities: Bool {
+        guard !availableActions.isEmpty else { return false }
+        guard state == .failedRecoverable, !hasPartialCommit else { return true }
+        return !availableActions.allSatisfy {
+            if case .resumeFromVerifiedStage = $0 { return true }
             return false
         }
     }
@@ -177,6 +238,7 @@ private struct ManagedOperation {
             let item = items[index]
             guard itemPhases.contains(item.state),
                   let receipt = item.receipt, !receipt.sourceCleanupPending,
+                  receipt.backupURL == nil,
                   committedEffects[item.id] == receipt,
                   let verification = item.verification else { return false }
             guard verification.policy == effectiveVerificationPolicy else { return false }
@@ -227,6 +289,7 @@ private struct Subscriber {
 
 private enum FatalServiceReason: Hashable {
     case journalUnavailable
+    case executorUnavailable
     case journalLoadFailure(String)
     case journalMutationFailure(String)
     case sequenceExhausted(OperationID)
@@ -257,20 +320,36 @@ public actor FileOperationService {
     private var activeID: OperationID?
     private var subscribers: [UUID: Subscriber] = [:]
     private var serviceMode: ServiceMode
+    private var startupReconciliationPending = false
+    private var startupReconciliationRuns = 0
+    private var startupActionIssuances = 0
     /// In-memory authorization that survives actor reentrancy but never a
     /// restart. Durable command selection remains the source of truth.
     private var recoveryLeases: [OperationID: RecoveryLease] = [:]
 
     public init(configuration: ServiceConfiguration = .default) throws {
-        _ = configuration
+        let journal: any OperationJournal
+        do {
+            journal = try SQLiteOperationJournal(url: configuration.journalURL)
+        } catch {
+            // Opening/migration/lock failures intentionally produce the same
+            // fail-closed service graph as an unavailable journal. The public
+            // initializer remains usable so the App can present safe-mode
+            // diagnostics without creating a second writer or guessing state.
+            journal = UnavailableOperationJournal(
+                diagnostic: "Durable operation journal is read-only safe mode: \(error)"
+            )
+        }
         let dependencies = ServiceDependencies(
-            journal: UnavailableOperationJournal(), fileSystem: UnavailableFileSystemAdapter(),
+            journal: journal, fileSystem: UnavailableFileSystemAdapter(),
             clock: SystemOperationClock(), ids: RandomOperationIDGenerator(), digest: NoopDigestProvider(),
             failpoints: NoopFailpointController(), executor: UnavailableExecutor(),
             diagnostics: NoopDiagnosticSink()
         )
-        self.dependencies = dependencies
-        self.serviceMode = .fatal([.journalUnavailable])
+        // M3 installs the live journal factory but does not authorize the
+        // public/default execution graph. M4 replaces this unavailable
+        // executor graph only after routing and crash gates pass.
+        try self.init(dependencies: dependencies, forceReadOnly: true)
     }
 
     /// M2 debug-only vertical slice. The journal is intentionally volatile;
@@ -293,18 +372,162 @@ public actor FileOperationService {
         ))
     }
 
-    package init(dependencies: ServiceDependencies) throws {
+    package static func makeTransactional(
+        journalURL: URL,
+        faults: NativeCopyFaultController = NativeCopyFaultController(),
+        serviceFailpoints: any FailpointController = NoopFailpointController(),
+        crashScenario: CrashScenarioContext? = nil
+    ) throws -> FileOperationService {
+        let workspace = NativeTransactionalWorkspace()
+        return try FileOperationService(dependencies: ServiceDependencies(
+            journal: try SQLiteOperationJournal(url: journalURL),
+            fileSystem: NativeTransactionalFileSystemAdapter(workspace: workspace),
+            clock: SystemOperationClock(),
+            ids: RandomOperationIDGenerator(),
+            digest: CommonCryptoDigestProvider(),
+            failpoints: serviceFailpoints,
+            executor: NativeTransactionalExecutor(
+                workspace: workspace,
+                faults: faults,
+                crashSyscallCounterURL: crashScenario?.syscallCounterURL
+            ),
+            diagnostics: NoopDiagnosticSink(),
+            crashScenario: crashScenario
+        ))
+    }
+
+    package static func makeCrashHarness(
+        journalURL: URL,
+        operationID: OperationID,
+        itemID: OperationItemID,
+        spec: CrashHarnessEffectSpec,
+        serviceFailpoints: any FailpointController = NoopFailpointController(),
+        crashScenario: CrashScenarioContext? = nil
+    ) throws -> FileOperationService {
+        do {
+            let bootstrap = try SQLiteOperationJournal(url: journalURL)
+            if try bootstrap.loadOperations().isEmpty {
+                let source = spec.from ?? spec.target ?? journalURL
+                let destination = spec.to ?? spec.target ?? journalURL
+                let item = OperationItemSnapshot(
+                    id: itemID,
+                    source: source,
+                    destination: destination,
+                    state: .completed,
+                    progress: .zero,
+                    metadata: nil,
+                    verification: nil,
+                    receipt: nil,
+                    failure: nil
+                )
+                let request = OperationRequest(
+                    kind: .copy,
+                    sources: [source],
+                    destination: destination,
+                    destinationMode: .exact,
+                    conflictPolicy: .stop
+                )
+                let snapshot = OperationSnapshot(
+                    schemaVersion: 1,
+                    id: operationID,
+                    kind: .copy,
+                    state: .completed,
+                    latestSequence: 0,
+                    request: request,
+                    effectiveMetadataPolicy: .finderCompatible,
+                    effectiveVerificationPolicy: .structural,
+                    progress: .zero,
+                    items: [item],
+                    pendingDecision: nil,
+                    terminalFailure: nil,
+                    availableActions: [],
+                    hasPartialCommit: false,
+                    sourceRetained: false
+                )
+                _ = try bootstrap.admit(snapshot, at: Date())
+            }
+        }
+        return try FileOperationService(dependencies: ServiceDependencies(
+            journal: try SQLiteOperationJournal(url: journalURL),
+            fileSystem: UnavailableFileSystemAdapter(),
+            clock: SystemOperationClock(),
+            ids: RandomOperationIDGenerator(),
+            digest: CommonCryptoDigestProvider(),
+            failpoints: serviceFailpoints,
+            executor: CrashHarnessEffectExecutor(spec: spec),
+            diagnostics: NoopDiagnosticSink(),
+            crashScenario: crashScenario
+        ))
+    }
+
+    package func runCrashHarnessEffect() async throws -> [DurableEffectRecord] {
+        guard operations.count == 1,
+              let operation = operations.values.first,
+              let item = operation.items.first,
+              let journal = dependencies.journal as? any DurableEffectJournal,
+              let executor = dependencies.executor as? any DurableEffectExecutor else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                diagnostic: "crash harness service is not uniquely configured",
+                retryable: false
+            )
+        }
+        let context = ExecutionContext(
+            operationID: operation.id,
+            itemID: item.id,
+            request: operation.request,
+            source: item.source,
+            destination: item.destination,
+            itemIndex: 0,
+            metadataPolicy: operation.effectiveMetadataPolicy,
+            verificationPolicy: operation.effectiveVerificationPolicy
+        )
+        let attempts = dependencies.crashScenario == nil ? 2 : 1
+        for _ in 0..<attempts {
+            let outcome = await performDurablePhase(
+                .commit,
+                context: context,
+                plan: ExecutionPlan(sourceDisposition: .noCleanup),
+                journal: journal,
+                executor: executor,
+                finalizePhase: false
+            )
+            if case .sourceCleaned = outcome { break }
+        }
+        return try journal.effectRecords(operationID: operation.id)
+    }
+
+    package func crashHarnessOwnerEpoch() -> UUID? {
+        (dependencies.journal as? any DurableEffectJournal)?.ownerEpoch
+    }
+
+    package func diagnosticServiceMode() -> String {
+        String(describing: serviceMode)
+    }
+
+    package func diagnosticStartupCounters() -> (runs: Int, actions: Int) {
+        (startupReconciliationRuns, startupActionIssuances)
+    }
+
+    package init(
+        dependencies: ServiceDependencies,
+        forceReadOnly: Bool = false
+    ) throws {
         self.dependencies = dependencies
         self.serviceMode = .normal
         var loadedOperations: [OperationID: ManagedOperation] = [:]
         var fatalReasons: Set<FatalServiceReason> = []
         var recoveryReasons: Set<RecoveryRequiredReason> = []
+        if forceReadOnly {
+            fatalReasons.insert(.executorUnavailable)
+        }
         if !dependencies.journal.isWritable {
             fatalReasons.insert(.journalUnavailable)
         }
         do {
             for stored in try dependencies.journal.loadOperations() {
-                let operation = ManagedOperation(journalOperation: stored)
+                let owned = stored
+                let operation = ManagedOperation(journalOperation: owned)
                 loadedOperations[operation.id] = operation
                 if operation.reservedThrough == UInt64.max {
                     fatalReasons.insert(.sequenceExhausted(operation.id))
@@ -317,6 +540,9 @@ public actor FileOperationService {
                     ))
                 } else if !operation.inProgressRecoveryActions.isEmpty {
                     recoveryReasons.insert(.durableCommand(operation.id))
+                }
+                if operation.hasExclusiveRecoveryCapabilities {
+                    recoveryReasons.insert(.unexplainedFilesystemEffect(operation.id))
                 }
                 if operation.hasUnresolvedRecoveryEffects {
                     recoveryReasons.insert(.unresolvedEffect(operation.id))
@@ -349,7 +575,13 @@ public actor FileOperationService {
         } else {
             serviceMode = .normal
         }
-        if fatalReasons.isEmpty && recoveryReasons.isEmpty {
+        if fatalReasons.isEmpty,
+           !recoveryReasons.isEmpty,
+           dependencies.journal is any DurableEffectJournal,
+           dependencies.executor is any DurableEffectExecutor {
+            startupReconciliationPending = true
+            Task { await self.reconcileDurableStartup() }
+        } else if fatalReasons.isEmpty && recoveryReasons.isEmpty {
             Task { await self.runScheduler() }
         }
     }
@@ -406,6 +638,7 @@ public actor FileOperationService {
     }
 
     public func snapshot(_ id: OperationID) async throws -> OperationSnapshot {
+        await waitForStartupReconciliation()
         guard let operation = operations[id] else {
             throw FileOperationFailure(code: .validation, operationID: id,
                                        diagnostic: "unknown operation ID", retryable: false)
@@ -638,6 +871,7 @@ public actor FileOperationService {
     }
 
     public func recover(_ id: OperationID, action: RecoveryAction) async throws {
+        await waitForStartupReconciliation()
         guard var operation = operations[id] else {
             throw FileOperationFailure(code: .validation, operationID: id,
                                        diagnostic: "unknown operation ID", retryable: false)
@@ -652,6 +886,15 @@ public actor FileOperationService {
         guard operation.availableActions.contains(action) else {
             throw FileOperationFailure(code: .controlRejected, operationID: id,
                                        diagnostic: "stale or unavailable recovery action", retryable: false)
+        }
+        if let durableJournal = dependencies.journal as? any DurableEffectJournal,
+           try !durableJournal.recoveryActionIsAuthorized(operationID: id, action: action) {
+            throw FileOperationFailure(
+                code: .controlRejected,
+                operationID: id,
+                diagnostic: "recovery action belongs to a stale journal owner epoch",
+                retryable: false
+            )
         }
         guard operation.inProgressRecoveryActions.count <= 1 else {
             throw FileOperationFailure(code: .serviceSafeMode, operationID: id,
@@ -688,6 +931,18 @@ public actor FileOperationService {
             // Scheduling must happen after lease/active ownership is released;
             // otherwise the queued task can observe the old active ID and exit.
             Task { await self.runScheduler() }
+        }
+
+        // Destructive durable recovery is read-only prevalidated before the
+        // command checkpoint revokes its sibling. If validation fails (for
+        // example, the committed destination was mutated), the operator must
+        // retain the alternative restore capability.
+        if !wasInProgress {
+            try await prevalidateDurableRecoverySelection(
+                id: id,
+                operation: operation,
+                action: action
+            )
         }
 
         // Select exactly one action and revoke all siblings in the same
@@ -736,10 +991,20 @@ public actor FileOperationService {
             if try await inspectUnknownCommits(
                 id: id, actionID: command.actionID, invocationID: lease.invocationID
             ) {
-                try await recoverCommittedEffects(
-                    id: id, effect: .rollbackCommittedDestination,
-                    actionID: command.actionID, invocationID: lease.invocationID
-                )
+                if dependencies.journal is any DurableEffectJournal,
+                   dependencies.executor is any DurableEffectExecutor {
+                    try await recoverDurableCommittedEffects(
+                        id: id, action: action,
+                        projectionEffect: .rollbackCommittedDestination,
+                        actionID: command.actionID,
+                        invocationID: lease.invocationID
+                    )
+                } else {
+                    try await recoverCommittedEffects(
+                        id: id, effect: .rollbackCommittedDestination,
+                        actionID: command.actionID, invocationID: lease.invocationID
+                    )
+                }
                 try requireRecoveryLease(id: id, actionID: command.actionID,
                                          invocationID: lease.invocationID)
                 try await convergeRolledBack(id: id)
@@ -749,16 +1014,30 @@ public actor FileOperationService {
         case .resumeFromVerifiedStage:
             try requireRecoveryLease(id: id, actionID: command.actionID,
                                      invocationID: lease.invocationID)
-            guard operations[id]?.state == .failedRecoverable else {
-                throw FileOperationFailure(code: .controlRejected, operationID: id,
-                                           diagnostic: "verified-stage resume requires writable failedRecoverable state",
-                                           retryable: false)
+            if dependencies.journal is any DurableEffectJournal,
+               dependencies.executor is any DurableEffectExecutor {
+                try await resumeDurableCommit(
+                    id: id,
+                    itemIndex: index,
+                    action: action,
+                    actionID: command.actionID,
+                    invocationID: lease.invocationID
+                )
+            } else {
+                guard operations[id]?.state == .failedRecoverable else {
+                    throw FileOperationFailure(
+                        code: .controlRejected,
+                        operationID: id,
+                        diagnostic: "verified-stage resume requires writable failedRecoverable state",
+                        retryable: false
+                    )
+                }
+                try transitionItem(id: id, index: index, to: .preflight) { item in
+                    item.failure = nil
+                }
+                operations[id]?.terminalFailure = nil
+                try transitionOperation(id: id, to: .preflight)
             }
-            try transitionItem(id: id, index: index, to: .preflight) { item in
-                item.failure = nil
-            }
-            operations[id]?.terminalFailure = nil
-            try transitionOperation(id: id, to: .preflight)
         case .retainSource:
             try await retainSourceAndStop(
                 id: id, itemIndex: index, actionID: command.actionID,
@@ -767,11 +1046,34 @@ public actor FileOperationService {
             try requireRecoveryLease(id: id, actionID: command.actionID,
                                      invocationID: lease.invocationID)
         case .discardKnownStaging:
-            try await performRecoveryEffect(
-                id: id, itemIndex: index, effect: .cleanupStaging,
-                actionID: command.actionID, invocationID: lease.invocationID,
-                receipt: nil
-            )
+            if operations[id]?.items[index].state != .recoveryRequired ||
+                operations[id]?.state != .recoveryRequired {
+                try projectItemAndOperationToRecoveryRequired(
+                    id: id,
+                    index: index
+                )
+                try requireRecoveryLease(
+                    id: id,
+                    actionID: command.actionID,
+                    invocationID: lease.invocationID,
+                    itemID: operation.items[index].id
+                )
+            }
+            if dependencies.journal is any DurableEffectJournal,
+               dependencies.executor is any DurableEffectExecutor {
+                try await recoverDurableItemEffects(
+                    id: id, itemIndex: index, action: action,
+                    projectionEffect: .cleanupStaging,
+                    actionID: command.actionID,
+                    invocationID: lease.invocationID
+                )
+            } else {
+                try await performRecoveryEffect(
+                    id: id, itemIndex: index, effect: .cleanupStaging,
+                    actionID: command.actionID, invocationID: lease.invocationID,
+                    receipt: nil
+                )
+            }
             try requireRecoveryLease(id: id, actionID: command.actionID,
                                      invocationID: lease.invocationID,
                                      itemID: operation.items[index].id,
@@ -786,10 +1088,20 @@ public actor FileOperationService {
             if try await inspectUnknownCommits(
                 id: id, actionID: command.actionID, invocationID: lease.invocationID
             ) {
-                try await recoverCommittedEffects(
-                    id: id, effect: .finalizeKnownCommit,
-                    actionID: command.actionID, invocationID: lease.invocationID
-                )
+                if dependencies.journal is any DurableEffectJournal,
+                   dependencies.executor is any DurableEffectExecutor {
+                    try await recoverDurableCommittedEffects(
+                        id: id, action: action,
+                        projectionEffect: .finalizeKnownCommit,
+                        actionID: command.actionID,
+                        invocationID: lease.invocationID
+                    )
+                } else {
+                    try await recoverCommittedEffects(
+                        id: id, effect: .finalizeKnownCommit,
+                        actionID: command.actionID, invocationID: lease.invocationID
+                    )
+                }
                 try requireRecoveryLease(id: id, actionID: command.actionID,
                                          invocationID: lease.invocationID)
                 try await convergeFinalizedPartialCommit(id: id)
@@ -802,12 +1114,366 @@ public actor FileOperationService {
         try requireRecoveryLease(id: id, actionID: command.actionID,
                                  invocationID: lease.invocationID)
         try completeRecoveryCommand(id: id, actionID: command.actionID)
+        if case .resumeFromVerifiedStage = action {
+            try issuePostResumeRecoveryActions(id: id)
+        }
+    }
+
+    fileprivate func prevalidateDurableRecoverySelection(
+        id: OperationID,
+        operation: ManagedOperation,
+        action: RecoveryAction
+    ) async throws {
+        switch action {
+        case .finalizeKnownCommit, .restoreBackup:
+            break
+        default:
+            return
+        }
+        guard let journal = dependencies.journal as? any DurableEffectJournal,
+              let executor = dependencies.executor as? any DurableEffectExecutor,
+              let index = activeItemIndex(operation) ??
+                operation.resumableDurableReceiptProjectionIndex ??
+                operation.items.indices.first(where: {
+                    [.failedRecoverable, .recoveryRequired, .cleanupRequired,
+                     .committedAwaitingCleanup, .cleaningSource]
+                        .contains(operation.items[$0].state)
+                }) else {
+            return
+        }
+        let item = operation.items[index]
+        let context = executionContext(operation: operation, itemIndex: index)
+        let records = try journal.effectRecords(operationID: id)
+            .filter { $0.intent.itemID == item.id }
+        let manifest = try journal.manifest(
+            operationID: id,
+            itemID: item.id
+        )
+        _ = try await executor.prepareRecoveryEffects(
+            for: action,
+            context: context,
+            receipt: operation.committedEffects[item.id],
+            records: records,
+            manifest: manifest
+        )
     }
 }
 
 // MARK: - Scheduling and execution
 
 private extension FileOperationService {
+    func reconcileDurableStartup() async {
+        startupReconciliationRuns += 1
+        guard let journal = dependencies.journal as? any DurableEffectJournal,
+              let executor = dependencies.executor as? any DurableEffectExecutor,
+              let ownerEpoch = journal.ownerEpoch,
+              !fatalModeActive else {
+            startupReconciliationPending = false
+            return
+        }
+        do {
+            let orderedIDs = operations.values
+                .sorted { $0.submissionOrdinal < $1.submissionOrdinal }
+                .map(\.id)
+            for id in orderedIDs {
+                guard let loaded = operations[id] else { continue }
+                let selectedAction = loaded.inProgressRecoveryActions.first.flatMap {
+                    selectedID in loaded.availableActions.first {
+                        $0.command.actionID == selectedID
+                    }
+                }
+                var records = try journal.effectRecords(operationID: id)
+                var chainCanAdvance: [String: Bool] = [:]
+                for record in records {
+                    let intent = record.intent
+                    let chainKey = [
+                        intent.itemID.rawValue.uuidString,
+                        intent.ownerEpoch.uuidString,
+                        intent.attemptID?.uuidString ?? "-",
+                        intent.actionID?.uuidString ?? "-",
+                    ].joined(separator: "|")
+                    let canAdvance = chainCanAdvance[chainKey] ?? true
+                    if let result = record.result {
+                        if result.status != .completed {
+                            chainCanAdvance[chainKey] = false
+                        }
+                        continue
+                    }
+                    guard intent.ownerEpoch != ownerEpoch else { continue }
+                    let inspection: DurableEffectExecutionOutcome
+                    if canAdvance {
+                        inspection = await executor.inspect(intent)
+                    } else {
+                        // One registered effect chain executes strictly by
+                        // ordinal. If an earlier effect was durably proven
+                        // not-completed, a later pre-registered syscall was
+                        // unreachable in the dead process.
+                        inspection = .notPerformed(
+                            evidence: Data("prior-effect-not-completed".utf8)
+                        )
+                    }
+                    let sequence = try reserveDurableEffectSequence(operationID: id)
+                    guard let operation = operations[id] else {
+                        throw FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: id,
+                            diagnostic: "startup reconciliation lost operation",
+                            retryable: false
+                        )
+                    }
+                    try journal.appendEffectResult(
+                        DurableEffectResultRecord(
+                            operationID: record.intent.operationID,
+                            itemID: record.intent.itemID,
+                            effectID: record.intent.effectID,
+                            status: inspection.status,
+                            resultIdentity: inspection.identity,
+                            systemCode: inspection.failure?.systemCode,
+                            evidence: inspection.evidence,
+                            resultSequence: sequence
+                        ),
+                        checkpoint: operation.journalOperation,
+                        summaryReceipt: nil
+                    )
+                    if inspection.status != .completed {
+                        chainCanAdvance[chainKey] = false
+                    }
+                }
+                records = try journal.effectRecords(operationID: id)
+
+                // Never checkpoint an old-owner capability under the new
+                // owner. Inspection is complete before this in-memory revoke,
+                // and the next event atomically persists its successor.
+                operations[id]?.availableActions.removeAll()
+                operations[id]?.inProgressRecoveryActions.removeAll()
+                try projectStartupRecovery(
+                    id: id,
+                    records: records,
+                    selectedAction: selectedAction
+                )
+            }
+            startupReconciliationPending = false
+            recomputeRecoveryModeAfterDurableCheckpoint()
+            if normalWritesAllowed { await runScheduler() }
+        } catch {
+            startupReconciliationPending = false
+            enterSafeMode(error)
+        }
+    }
+
+    func projectStartupRecovery(
+        id: OperationID,
+        records: [DurableEffectRecord],
+        selectedAction: RecoveryAction?
+    ) throws {
+        guard let operation = operations[id] else { return }
+        let terminal: Set<OperationState> = [
+            .completed, .completedWithSkips, .completedWithSourceRetained,
+            .cancelled, .rolledBack,
+        ]
+        if terminal.contains(operation.state) { return }
+
+        for index in operation.items.indices {
+            let item = operations[id]!.items[index]
+            let itemRecords = records.filter { $0.intent.itemID == item.id }
+            let backupDisposed = itemRecords.contains {
+                $0.intent.kind == .purgeBackup &&
+                    $0.result?.status == .completed
+            } || itemRecords.contains {
+                $0.intent.kind == .restoreBackup &&
+                    $0.result?.status == .completed
+            }
+            if backupDisposed, let selectedAction {
+                let template: RecoveryAction?
+                switch selectedAction {
+                case .finalizeKnownCommit:
+                    template = .finalizeKnownCommit(RecoveryCommand(
+                        actionID: UUID(), expectedSequence: 0
+                    ))
+                case .restoreBackup:
+                    template = .restoreBackup(RecoveryCommand(
+                        actionID: UUID(), expectedSequence: 0
+                    ))
+                default:
+                    template = nil
+                }
+                if let template {
+                    try issueStartupActions(
+                        id: id,
+                        itemID: item.id,
+                        templates: [template],
+                        selectedAction: selectedAction
+                    )
+                    return
+                }
+            }
+            if item.receipt?.backupURL != nil, !backupDisposed {
+                try projectItemAndOperationToRecoveryRequired(id: id, index: index)
+                try issueStartupActions(
+                    id: id,
+                    itemID: item.id,
+                    templates: [
+                        .finalizeKnownCommit(RecoveryCommand(
+                            actionID: UUID(), expectedSequence: 0
+                        )),
+                        .restoreBackup(RecoveryCommand(
+                            actionID: UUID(), expectedSequence: 0
+                        )),
+                    ],
+                    selectedAction: selectedAction
+                )
+                return
+            }
+
+            if item.receipt?.sourceCleanupPending == true,
+               [.sourceQuarantining, .cleaningSource, .cleanupRequired,
+                .recoveryRequired, .committedAwaitingCleanup].contains(item.state) {
+                let quarantineStarted = itemRecords.contains {
+                    $0.intent.kind == .quarantineSource
+                }
+                try projectItemAndOperationToRecoveryRequired(id: id, index: index)
+                var templates: [RecoveryAction] = [
+                    .retrySourceCleanup(RecoveryCommand(
+                        actionID: UUID(), expectedSequence: 0
+                    ))
+                ]
+                if !quarantineStarted {
+                    templates.append(.retainSource(RecoveryCommand(
+                        actionID: UUID(), expectedSequence: 0
+                    )))
+                }
+                try issueStartupActions(
+                    id: id,
+                    itemID: item.id,
+                    templates: templates,
+                    selectedAction: selectedAction
+                )
+                return
+            }
+            if item.receipt?.sourceCleanupPending == false,
+               [.sourceQuarantining, .cleaningSource].contains(item.state) {
+                // The final cleanup result and cleanup-free receipt were
+                // committed atomically. Only the state projection is stale;
+                // replaying quarantine/purge here would be a second external
+                // effect.
+                if item.state == .sourceQuarantining {
+                    try transitionItem(id: id, index: index, to: .cleaningSource)
+                }
+                if operations[id]?.state == .sourceQuarantining {
+                    try transitionOperation(id: id, to: .cleaningSource)
+                }
+                try transitionItem(id: id, index: index, to: .completed) {
+                    $0.failure = nil
+                }
+                operations[id]?.terminalFailure = nil
+                try finishOrAdvance(id: id)
+                return
+            }
+
+            let commitRecords = itemRecords.filter {
+                [.stageCommit, .backupDestination, .commitReplacement]
+                    .contains($0.intent.kind)
+            }
+            guard item.verification != nil,
+                  !commitRecords.isEmpty,
+                  item.receipt == nil else { continue }
+            let hasAmbiguous = commitRecords.contains {
+                $0.result?.status == .ambiguous || $0.result == nil
+            }
+            let hasUnfinished = commitRecords.contains {
+                $0.result?.status != .completed
+            }
+            var templates: [RecoveryAction] = []
+            if !hasAmbiguous {
+                templates.append(.resumeFromVerifiedStage(RecoveryCommand(
+                    actionID: UUID(), expectedSequence: 0
+                )))
+            }
+            if hasUnfinished {
+                templates.append(.discardKnownStaging(RecoveryCommand(
+                    actionID: UUID(), expectedSequence: 0
+                )))
+            }
+            guard !templates.isEmpty else {
+                markRecoveryRequired(.unexplainedFilesystemEffect(id))
+                return
+            }
+            try issueStartupActions(
+                id: id,
+                itemID: item.id,
+                templates: templates,
+                selectedAction: selectedAction
+            )
+            return
+        }
+    }
+
+    func projectItemAndOperationToRecoveryRequired(
+        id: OperationID,
+        index: Int
+    ) throws {
+        if operations[id]?.items[index].state != .recoveryRequired {
+            try transitionItem(id: id, index: index, to: .recoveryRequired)
+        }
+        if operations[id]?.state != .recoveryRequired {
+            try transitionOperation(id: id, to: .recoveryRequired)
+        }
+        markRecoveryRequired(.unexplainedFilesystemEffect(id))
+    }
+
+    func issueStartupActions(
+        id: OperationID,
+        itemID: OperationItemID,
+        templates: [RecoveryAction],
+        selectedAction: RecoveryAction?
+    ) throws {
+        startupActionIssuances += 1
+        let safeTemplates: [RecoveryAction]
+        if let selectedAction {
+            safeTemplates = templates.filter {
+                sameRecoveryKind($0, selectedAction)
+            }
+            guard !safeTemplates.isEmpty else {
+                markRecoveryRequired(.unexplainedFilesystemEffect(id))
+                return
+            }
+        } else {
+            safeTemplates = templates
+        }
+        try commitEvent(id: id, itemID: itemID) { operation, sequence in
+            let actions = safeTemplates.map {
+                $0.reissued(
+                    actionID: dependencies.ids.actionID(),
+                    expectedSequence: sequence
+                )
+            }
+            operation.availableActions = actions
+            return .recoveryAvailable(actions)
+        }
+        markRecoveryRequired(.unexplainedFilesystemEffect(id))
+    }
+
+    func sameRecoveryKind(_ lhs: RecoveryAction, _ rhs: RecoveryAction) -> Bool {
+        switch (lhs, rhs) {
+        case (.resumeFromVerifiedStage, .resumeFromVerifiedStage),
+             (.retrySourceCleanup, .retrySourceCleanup),
+             (.retainSource, .retainSource),
+             (.rollbackCommittedDestination, .rollbackCommittedDestination),
+             (.restoreBackup, .restoreBackup),
+             (.finalizeKnownCommit, .finalizeKnownCommit),
+             (.discardKnownStaging, .discardKnownStaging):
+            return true
+        default:
+            return false
+        }
+    }
+
+    func waitForStartupReconciliation() async {
+        while startupReconciliationPending {
+            await Task.yield()
+        }
+    }
+
     func runScheduler() async {
         guard normalWritesAllowed, activeID == nil else { return }
         let candidate = operations.values
@@ -1037,6 +1703,61 @@ private extension FileOperationService {
                 return
             }
 
+            await dependencies.failpoints.hit(
+                .verificationReadyBeforeEffects,
+                operationID: id
+            )
+            if let journal = dependencies.journal as? any DurableEffectJournal,
+               let executor = dependencies.executor as? any DurableEffectExecutor {
+                do {
+                    try await registerCommitEffectsBeforeMutation(
+                        context: context,
+                        plan: plan,
+                        journal: journal,
+                        executor: executor,
+                        verification: verificationOutcome
+                    )
+                } catch {
+                    controls[id] = nil
+                    let failure: FileOperationFailure
+                    if let native = error as? NativeFileError {
+                        failure = native.failure(
+                            operationID: id,
+                            itemID: item.id
+                        )
+                    } else if let typed = error as? FileOperationFailure {
+                        failure = typed
+                    } else {
+                        failure = FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: id,
+                            itemID: item.id,
+                            phase: .verifying,
+                            diagnostic: String(describing: error),
+                            retryable: false
+                        )
+                    }
+                    let hasOwnedStaging =
+                        operation.request.kind == .replace ||
+                        plan.sourceDisposition == .cleanupRequired
+                    if hasOwnedStaging {
+                        try await failPrecommitWithOwnedStaging(
+                            id: id,
+                            itemIndex: index,
+                            failure: failure
+                        )
+                    } else {
+                        try failItem(
+                            id: id,
+                            itemIndex: index,
+                            failure: failure,
+                            ambiguous: false
+                        )
+                    }
+                    return
+                }
+            }
+
             // The committing state is the durable pre-effect intent. If either
             // transition fails, perform(.commit) is never invoked.
             try transitionItem(id: id, index: index, to: .committing) { managedItem in
@@ -1072,7 +1793,8 @@ private extension FileOperationService {
         // any semantic mismatch. The destination effect is already visible;
         // losing this receipt would turn a diagnosable invariant failure into
         // an unsafe, uninspectable retry.
-        if operations[id]?.items[index].receipt != receipt ||
+        if dependencies.journal is any DurableEffectJournal ||
+            operations[id]?.items[index].receipt != receipt ||
             operations[id]?.committedEffects[item.id] != receipt {
             try recordReceipt(id: id, itemIndex: index, receipt: receipt)
         }
@@ -1092,6 +1814,14 @@ private extension FileOperationService {
         // Receipt durability is the cleanup barrier. No source cleanup phase
         // can begin until this event and both committed transitions succeed.
         try transitionItem(id: id, index: index, to: .committed)
+        if receipt.backupURL != nil, !cleanupRequired {
+            try issueReplaceRecoveryActions(id: id, itemIndex: index)
+            try transitionItem(id: id, index: index, to: .recoveryRequired)
+            try transitionOperation(id: id, to: .recoveryRequired)
+            markRecoveryRequired(.unexplainedFilesystemEffect(id))
+            activeID = nil
+            return
+        }
         if !cleanupRequired {
             try transitionItem(id: id, index: index, to: .completed)
             try finishOrAdvance(id: id)
@@ -1115,8 +1845,57 @@ private extension FileOperationService {
             try failCleanup(id: id, itemIndex: index, failure: failure, ambiguous: true)
             return
         }
+        await dependencies.failpoints.hit(
+            .sourceCleanupInspectedBeforeQuarantineIntent,
+            operationID: id
+        )
         try transitionItem(id: id, index: index, to: .sourceQuarantining)
         try transitionOperation(id: id, to: .sourceQuarantining)
+        if let durableJournal = dependencies.journal as? any DurableEffectJournal,
+           let durableExecutor = dependencies.executor as? any DurableEffectExecutor {
+            let quarantine = await performDurablePhase(
+                .sourceCleanup,
+                context: context,
+                plan: plan,
+                journal: durableJournal,
+                executor: durableExecutor,
+                allowedKinds: [.quarantineSource],
+                finalizePhase: false
+            )
+            guard case .sourceCleaned = quarantine else {
+                switch quarantine {
+                case let .failed(failure):
+                    try failCleanup(
+                        id: id,
+                        itemIndex: index,
+                        failure: failure,
+                        ambiguous: false
+                    )
+                case let .recoveryRequired(failure):
+                    try failCleanup(
+                        id: id,
+                        itemIndex: index,
+                        failure: failure,
+                        ambiguous: true
+                    )
+                default:
+                    try failCleanup(
+                        id: id,
+                        itemIndex: index,
+                        failure: FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: id,
+                            itemID: item.id,
+                            phase: .sourceQuarantining,
+                            diagnostic: "unexpected quarantine durable effect outcome",
+                            retryable: false
+                        ),
+                        ambiguous: true
+                    )
+                }
+                return
+            }
+        }
         try transitionItem(id: id, index: index, to: .cleaningSource)
         try transitionOperation(id: id, to: .cleaningSource)
 
@@ -1125,16 +1904,28 @@ private extension FileOperationService {
         let cleaned = await performPhase(
             .sourceCleanup, context: context, plan: plan, control: cleanupControl
         )
-        let stillOwnsCleanup = controls[id] === cleanupControl && cleanupIsAuthorized(
-            id: id, itemIndex: index, expectedStates: [.cleaningSource],
-            expectedReceipt: receipt
-        )
+        let currentCleanupReceipt = operations[id]?.items[index].receipt
+        let stillOwnsCleanup = controls[id] === cleanupControl &&
+            activeID == id &&
+            operations[id]?.state == .cleaningSource &&
+            operations[id]?.items[index].state == .cleaningSource &&
+            currentCleanupReceipt?.committedIdentityDigest ==
+                receipt.committedIdentityDigest &&
+            currentCleanupReceipt?.backupURL == receipt.backupURL
         controls[id] = nil
         guard stillOwnsCleanup else { return }
         switch cleaned {
         case .sourceCleaned:
             try recordSourceCleanupCompleted(id: id, itemIndex: index)
             operations[id]?.terminalFailure = nil
+            if operations[id]?.items[index].receipt?.backupURL != nil {
+                try issueReplaceRecoveryActions(id: id, itemIndex: index)
+                try transitionItem(id: id, index: index, to: .recoveryRequired)
+                try transitionOperation(id: id, to: .recoveryRequired)
+                markRecoveryRequired(.unexplainedFilesystemEffect(id))
+                activeID = nil
+                return
+            }
             try transitionItem(id: id, index: index, to: .completed)
             try finishOrAdvance(id: id)
         case let .failed(failure):
@@ -1185,6 +1976,19 @@ private extension FileOperationService {
             await control.endPhase()
             return .cancelled
         }
+        if phase == .commit || phase == .sourceCleanup,
+           let durableJournal = dependencies.journal as? any DurableEffectJournal,
+           let durableExecutor = dependencies.executor as? any DurableEffectExecutor {
+            let outcome = await performDurablePhase(
+                phase,
+                context: context,
+                plan: plan,
+                journal: durableJournal,
+                executor: durableExecutor
+            )
+            await control.endPhase()
+            return outcome
+        }
         let outcome = await dependencies.executor.perform(
             phase, context: context, plan: plan, controls: control
         ) { progress in
@@ -1194,6 +1998,400 @@ private extension FileOperationService {
         }
         await control.endPhase()
         return outcome
+    }
+
+    func performDurablePhase(
+        _ phase: ExecutionPhase,
+        context: ExecutionContext,
+        plan: ExecutionPlan,
+        journal: any DurableEffectJournal,
+        executor: any DurableEffectExecutor,
+        allowedKinds: Set<DurableEffectKind>? = nil,
+        finalizePhase: Bool = true,
+        preparedEffects: [DurableEffectPreparation]? = nil,
+        actionID: UUID? = nil
+    ) async -> ExecutionPhaseOutcome {
+        guard let ownerEpoch = journal.ownerEpoch else {
+            return .failed(FileOperationFailure(
+                code: .serviceSafeMode,
+                operationID: context.operationID,
+                itemID: context.itemID,
+                phase: operationStateForDurablePhase(phase),
+                diagnostic: "durable effect execution has no journal owner epoch",
+                retryable: false
+            ))
+        }
+        do {
+            if preparedEffects == nil {
+                let manifest = try await executor.manifestNodes(for: context)
+                if !manifest.isEmpty {
+                    try journal.replaceManifest(
+                        operationID: context.operationID,
+                        itemID: context.itemID,
+                        nodes: manifest
+                    )
+                }
+            }
+            var preparations: [DurableEffectPreparation]
+            if let preparedEffects {
+                preparations = preparedEffects
+            } else {
+                preparations = try await executor.prepareEffects(
+                    for: phase,
+                    context: context,
+                    plan: plan
+                )
+            }
+            if let allowedKinds {
+                preparations = preparations.filter { allowedKinds.contains($0.kind) }
+            }
+            guard !preparations.isEmpty else {
+                throw FileOperationFailure(
+                    code: .invariantViolation,
+                    operationID: context.operationID,
+                    itemID: context.itemID,
+                    phase: operationStateForDurablePhase(phase),
+                    diagnostic: "destructive phase produced no durable effects",
+                    retryable: false
+                )
+            }
+            var records = try journal.effectRecords(operationID: context.operationID)
+                .filter { $0.intent.itemID == context.itemID }
+            var completed: [DurableEffectRecord] = []
+
+            for preparation in preparations {
+                let existing = records.last {
+                    $0.intent.kind == preparation.kind &&
+                        $0.intent.nodeID == preparation.nodeID &&
+                        $0.intent.relativePath == preparation.relativePath &&
+                        $0.result?.status != .notPerformed
+                }
+                let intent: DurableEffectIntent
+                var result = existing?.result
+                if let existing {
+                    guard existing.intent.expectedIdentity == preparation.expectedIdentity,
+                          existing.intent.manifestDigest == preparation.manifestDigest else {
+                        throw FileOperationFailure(
+                            code: .recoveryRequired,
+                            operationID: context.operationID,
+                            itemID: context.itemID,
+                            phase: operationStateForDurablePhase(phase),
+                            diagnostic: "durable effect preparation changed across restart",
+                            retryable: false
+                        )
+                    }
+                    intent = existing.intent
+                } else {
+                    let ordinal = (records.map(\.intent.effectOrdinal).max() ?? 0) + 1
+                    let sequence = try reserveDurableEffectSequence(
+                        operationID: context.operationID
+                    )
+                    intent = DurableEffectIntent(
+                        effectID: UUID(),
+                        operationID: context.operationID,
+                        itemID: context.itemID,
+                        attemptID: actionID,
+                        actionID: actionID,
+                        ownerEpoch: ownerEpoch,
+                        effectOrdinal: ordinal,
+                        kind: preparation.kind,
+                        nodeID: preparation.nodeID,
+                        relativePath: preparation.relativePath,
+                        expectedIdentity: preparation.expectedIdentity,
+                        manifestDigest: preparation.manifestDigest,
+                        intentSequence: sequence
+                    )
+                    guard let operation = operations[context.operationID] else {
+                        throw FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: context.operationID,
+                            diagnostic: "operation disappeared before effect intent",
+                            retryable: false
+                        )
+                    }
+                    try journal.appendEffectIntent(intent, checkpoint: operation.journalOperation)
+                    try await acknowledge(
+                        intent: intent,
+                        window: .intentDurableBeforeEffect,
+                        sequence: sequence
+                    )
+                    records.append(DurableEffectRecord(intent: intent, result: nil))
+                }
+
+                if result == nil {
+                    let execution: DurableEffectExecutionOutcome
+                    // Verification pre-registers the complete current-owner
+                    // inventory. Those intents have not run yet and remain
+                    // authorized for their first syscall. A prior-owner intent
+                    // is a crash window and must be inspected read-only.
+                    if existing == nil || intent.ownerEpoch == ownerEpoch {
+                        if existing != nil {
+                            try await acknowledge(
+                                intent: intent,
+                                window: .intentDurableBeforeEffect,
+                                sequence: intent.intentSequence
+                            )
+                        }
+                        execution = await executor.perform(intent)
+                        try await acknowledge(
+                            intent: intent,
+                            window: .effectReturnedBeforeResult,
+                            sequence: intent.intentSequence
+                        )
+                    } else {
+                        execution = await executor.inspect(intent)
+                    }
+                    let resultSequence = try reserveDurableEffectSequence(
+                        operationID: context.operationID
+                    )
+                    result = DurableEffectResultRecord(
+                        operationID: intent.operationID,
+                        itemID: intent.itemID,
+                        effectID: intent.effectID,
+                        status: execution.status,
+                        resultIdentity: execution.identity,
+                        systemCode: execution.failure?.systemCode,
+                        evidence: execution.evidence,
+                        resultSequence: resultSequence
+                    )
+                    guard let result else {
+                        throw FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: context.operationID,
+                            diagnostic: "operation disappeared before effect result",
+                            retryable: false
+                        )
+                    }
+                    let prospective = completed + [
+                        DurableEffectRecord(intent: intent, result: result)
+                    ]
+                    let receipt = finalizePhase && execution.status == .completed
+                        ? await executor.summaryReceipt(
+                            for: phase,
+                            completed: prospective,
+                            context: context,
+                            plan: plan
+                        )
+                        : nil
+                    // `summaryReceipt` is async and therefore an actor
+                    // reentrancy boundary. Reload the operation afterwards so
+                    // a current recovery selection cannot be overwritten by a
+                    // stale pre-await copy containing sibling capabilities.
+                    guard var operation = operations[context.operationID] else {
+                        throw FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: context.operationID,
+                            diagnostic: "operation disappeared before effect result checkpoint",
+                            retryable: false
+                        )
+                    }
+                    if let receipt,
+                       let index = operation.items.firstIndex(where: {
+                           $0.id == context.itemID
+                       }) {
+                        operation.items[index].receipt = receipt
+                        operation.committedEffects[context.itemID] = receipt
+                    }
+                    try journal.appendEffectResult(
+                        result,
+                        checkpoint: operation.journalOperation,
+                        summaryReceipt: receipt
+                    )
+                    if receipt != nil {
+                        operations[context.operationID] = operation
+                    }
+                    try await acknowledge(
+                        intent: intent,
+                        window: .resultDurableBeforeNextEffect,
+                        sequence: resultSequence
+                    )
+                }
+
+                guard let durableResult = result else {
+                    throw FileOperationFailure(
+                        code: .invariantViolation,
+                        operationID: context.operationID,
+                        diagnostic: "durable effect result vanished",
+                        retryable: false
+                    )
+                }
+                let record = DurableEffectRecord(intent: intent, result: durableResult)
+                completed.append(record)
+                switch durableResult.status {
+                case .completed:
+                    continue
+                case .notPerformed:
+                    return .failed(FileOperationFailure(
+                        code: .recoveryRequired,
+                        operationID: context.operationID,
+                        itemID: context.itemID,
+                        phase: operationStateForDurablePhase(phase),
+                        diagnostic: "durable filesystem effect was proven not performed",
+                        retryable: true
+                    ))
+                case .ambiguous:
+                    return .recoveryRequired(FileOperationFailure(
+                        code: .recoveryRequired,
+                        operationID: context.operationID,
+                        itemID: context.itemID,
+                        phase: operationStateForDurablePhase(phase),
+                        diagnostic: "durable filesystem effect outcome is ambiguous",
+                        retryable: false
+                    ))
+                }
+            }
+            if finalizePhase,
+               operations[context.operationID]?.committedEffects[context.itemID] == nil,
+               let last = completed.last,
+               let lastResult = last.result {
+                let receipt = await executor.summaryReceipt(
+                    for: phase,
+                    completed: completed,
+                    context: context,
+                    plan: plan
+                )
+                if let receipt {
+                    // W2 can leave every filesystem effect durably inspected
+                    // as completed while the atomic result+receipt checkpoint
+                    // never happened. Re-append the immutable last result with
+                    // the reconstructed summary to repair that exact window
+                    // without replaying the effect.
+                    guard var operation = operations[context.operationID],
+                          let index = operation.items.firstIndex(where: {
+                              $0.id == context.itemID
+                          }) else {
+                        throw FileOperationFailure(
+                            code: .invariantViolation,
+                            operationID: context.operationID,
+                            itemID: context.itemID,
+                            diagnostic: "operation disappeared before receipt repair",
+                            retryable: false
+                        )
+                    }
+                    operation.items[index].receipt = receipt
+                    operation.committedEffects[context.itemID] = receipt
+                    try journal.appendEffectResult(
+                        lastResult,
+                        checkpoint: operation.journalOperation,
+                        summaryReceipt: receipt
+                    )
+                    operations[context.operationID] = operation
+                }
+            }
+            if !finalizePhase { return .sourceCleaned }
+            return await executor.outcome(
+                for: phase,
+                completed: completed,
+                context: context,
+                plan: plan
+            )
+        } catch let failure as FileOperationFailure {
+            return .recoveryRequired(failure)
+        } catch {
+            enterSafeMode(error)
+            return .recoveryRequired(FileOperationFailure(
+                code: .journalFailure,
+                operationID: context.operationID,
+                itemID: context.itemID,
+                phase: operationStateForDurablePhase(phase),
+                diagnostic: String(describing: error),
+                retryable: false
+            ))
+        }
+    }
+
+    /// Freezes every commit mutation and the verified manifest in one SQLite
+    /// transaction. A restart can therefore recover staging and parent
+    /// identities without consulting the executor's process-local registry.
+    func registerCommitEffectsBeforeMutation(
+        context: ExecutionContext,
+        plan: ExecutionPlan,
+        journal: any DurableEffectJournal,
+        executor: any DurableEffectExecutor,
+        verification: VerificationOutcome
+    ) async throws {
+        guard let operation = operations[context.operationID],
+              operation.items.indices.contains(context.itemIndex),
+              operation.items[context.itemIndex].verification == nil,
+              operation.state == .verifying,
+              operation.items[context.itemIndex].state == .verifying else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: context.operationID,
+                itemID: context.itemID,
+                diagnostic: "commit effect registration lost verified ownership",
+                retryable: false
+            )
+        }
+        let manifest = try await executor.manifestNodes(for: context)
+        let preparations = try await executor.prepareEffects(
+            for: .commit,
+            context: context,
+            plan: plan
+        )
+        guard !manifest.isEmpty, !preparations.isEmpty else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: context.operationID,
+                itemID: context.itemID,
+                diagnostic: "verified commit lacks a frozen manifest or effect inventory",
+                retryable: false
+            )
+        }
+        var checkpoint = operation
+        checkpoint.items[context.itemIndex].verification = verification
+        let registration = try journal.registerEffectPreparations(
+            operationID: context.operationID,
+            itemID: context.itemID,
+            preparations: preparations,
+            manifest: manifest,
+            checkpoint: checkpoint.journalOperation
+        )
+        operations[context.operationID] = ManagedOperation(
+            journalOperation: registration.operation
+        )
+    }
+
+    func reserveDurableEffectSequence(operationID: OperationID) throws -> EventSequence {
+        guard var operation = operations[operationID] else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: operationID,
+                diagnostic: "cannot reserve an effect sequence for an unknown operation",
+                retryable: false
+            )
+        }
+        let range = try dependencies.journal.reserveSequences(for: operationID, count: 1)
+        operation.reservedThrough = range.upperBound
+        operations[operationID] = operation
+        return range.lowerBound
+    }
+
+    func acknowledge(
+        intent: DurableEffectIntent,
+        window: CrashAcknowledgementWindow,
+        sequence: EventSequence
+    ) async throws {
+        guard let scenario = dependencies.crashScenario else { return }
+        await dependencies.failpoints.hit(CrashAcknowledgement(
+            scenarioID: scenario.scenarioID,
+            runNonce: scenario.runNonce,
+            operationID: intent.operationID,
+            itemID: intent.itemID,
+            effectID: intent.effectID,
+            kind: intent.kind,
+            effectOrdinal: intent.effectOrdinal,
+            window: window,
+            ownerEpoch: intent.ownerEpoch,
+            journalSequence: sequence,
+            nodeID: intent.nodeID,
+            relativePath: intent.relativePath,
+            manifestDigest: intent.manifestDigest
+        ))
+    }
+
+    func operationStateForDurablePhase(_ phase: ExecutionPhase) -> OperationState {
+        phase == .sourceCleanup ? .cleaningSource : .committing
     }
 
     func phaseIsAuthorized(_ phase: ExecutionPhase, context: ExecutionContext,
@@ -1320,7 +2518,7 @@ private extension FileOperationService {
         }
         let completed = OperationReceiptSummary(
             committedIdentityDigest: receipt.committedIdentityDigest,
-            backupURL: receipt.backupURL, quarantineURL: receipt.quarantineURL,
+            backupURL: receipt.backupURL, quarantineURL: nil,
             sourceCleanupPending: false
         )
         try recordReceipt(id: id, itemIndex: itemIndex, receipt: completed)
@@ -1338,24 +2536,36 @@ private extension FileOperationService {
             id: id, index: itemIndex, to: ambiguous ? .recoveryRequired : .cleanupRequired
         )
         try transitionOperation(id: id, to: ambiguous ? .recoveryRequired : .cleanupRequired)
-        try issueCleanupRecoveryActions(id: id, itemIndex: itemIndex, ambiguous: ambiguous)
+        let hasQuarantineIntent =
+            (try? (dependencies.journal as? any DurableEffectJournal)?
+                .effectRecords(operationID: id)
+                .contains {
+                    $0.intent.itemID == itemID &&
+                        $0.intent.kind == .quarantineSource
+                }) ?? false
+        try issueCleanupRecoveryActions(
+            id: id,
+            itemIndex: itemIndex,
+            allowRetain: !hasQuarantineIntent
+        )
         activeID = nil
         Task { await self.runScheduler() }
     }
 
     func issueCleanupRecoveryActions(id: OperationID, itemIndex: Int,
-                                     ambiguous: Bool) throws {
-        _ = ambiguous
+                                     allowRetain: Bool) throws {
         let itemID = operations[id]!.items[itemIndex].id
         try commitEvent(id: id, itemID: itemID) { operation, sequence in
-            let actions: [RecoveryAction] = [
+            var actions: [RecoveryAction] = [
                 .retrySourceCleanup(RecoveryCommand(
-                    actionID: dependencies.ids.actionID(), expectedSequence: sequence
-                )),
-                .retainSource(RecoveryCommand(
                     actionID: dependencies.ids.actionID(), expectedSequence: sequence
                 ))
             ]
+            if allowRetain {
+                actions.append(.retainSource(RecoveryCommand(
+                    actionID: dependencies.ids.actionID(), expectedSequence: sequence
+                )))
+            }
             operation.availableActions = actions
             return .recoveryAvailable(actions)
         }
@@ -1627,6 +2837,33 @@ private extension FileOperationService {
             return .recoveryAvailable(actions)
         }
     }
+
+    func issueReplaceRecoveryActions(id: OperationID, itemIndex: Int) throws {
+        let itemID = operations[id]!.items[itemIndex].id
+        guard operations[id]?.items[itemIndex].receipt?.backupURL != nil else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: id,
+                itemID: itemID,
+                diagnostic: "replace recovery actions require a durable backup receipt",
+                retryable: false
+            )
+        }
+        try commitEvent(id: id, itemID: itemID) { operation, sequence in
+            let actions: [RecoveryAction] = [
+                .finalizeKnownCommit(RecoveryCommand(
+                    actionID: dependencies.ids.actionID(),
+                    expectedSequence: sequence
+                )),
+                .restoreBackup(RecoveryCommand(
+                    actionID: dependencies.ids.actionID(),
+                    expectedSequence: sequence
+                )),
+            ]
+            operation.availableActions = actions
+            return .recoveryAvailable(actions)
+        }
+    }
 }
 
 // MARK: - Control convergence
@@ -1695,10 +2932,6 @@ private extension FileOperationService {
                 retryable: false
             )
         }
-        let context = executionContext(operation: operation, itemIndex: itemIndex)
-        let inspection = await dependencies.executor.inspectSourceBeforeCleanup(
-            context, receipt: receipt
-        )
         if let actionID, let invocationID {
             try requireRecoveryLease(id: id, actionID: actionID,
                                      invocationID: invocationID,
@@ -1706,6 +2939,29 @@ private extension FileOperationService {
         } else {
             try requireNormalOwnership(
                 id: id, command: "cancel", expectedStates: [.committedAwaitingCleanup]
+            )
+        }
+        let context = executionContext(operation: operation, itemIndex: itemIndex)
+        let inspection: ExecutionSourceInspection
+        if actionID != nil,
+           let journal = dependencies.journal as? any DurableEffectJournal,
+           let executor = dependencies.executor as? any DurableEffectExecutor {
+            let records = try journal.effectRecords(operationID: id)
+                .filter { $0.intent.itemID == operation.items[itemIndex].id }
+            let manifest = try journal.manifest(
+                operationID: id,
+                itemID: operation.items[itemIndex].id
+            )
+            inspection = await executor.inspectSourceForRetention(
+                context: context,
+                receipt: receipt,
+                records: records,
+                manifest: manifest
+            )
+        } else {
+            inspection = await dependencies.executor.inspectSourceBeforeCleanup(
+                context,
+                receipt: receipt
             )
         }
         switch inspection {
@@ -1723,7 +2979,7 @@ private extension FileOperationService {
         try restoreDurableCleanupBarrier(id: id, itemIndex: itemIndex, receipt: receipt)
         let retained = OperationReceiptSummary(
             committedIdentityDigest: receipt.committedIdentityDigest,
-            backupURL: receipt.backupURL, quarantineURL: receipt.quarantineURL,
+            backupURL: receipt.backupURL, quarantineURL: nil,
             sourceCleanupPending: false
         )
         try commitEvent(id: id, itemID: operations[id]!.items[itemIndex].id) { operation, _ in
@@ -1984,6 +3240,49 @@ private extension FileOperationService {
             )
         }
         let item = operation.items[itemIndex]
+        if dependencies.journal is any DurableEffectJournal,
+           dependencies.executor is any DurableEffectExecutor {
+            guard let action = operation.availableActions.first(where: {
+                $0.command.actionID == actionID
+            }) else {
+                throw FileOperationFailure(
+                    code: .controlRejected,
+                    operationID: id,
+                    itemID: item.id,
+                    diagnostic: "durable cleanup action is unavailable",
+                    retryable: false
+                )
+            }
+            try restoreDurableCleanupBarrier(
+                id: id,
+                itemIndex: itemIndex,
+                receipt: receipt
+            )
+            try transitionItem(id: id, index: itemIndex, to: .sourceQuarantining)
+            try transitionOperation(id: id, to: .sourceQuarantining)
+            try await recoverDurableItemEffects(
+                id: id,
+                itemIndex: itemIndex,
+                action: action,
+                projectionEffect: .cleanupSource,
+                actionID: actionID,
+                invocationID: invocationID
+            )
+            try transitionItem(id: id, index: itemIndex, to: .cleaningSource)
+            try transitionOperation(id: id, to: .cleaningSource)
+            try recordSourceCleanupCompleted(id: id, itemIndex: itemIndex)
+            operations[id]?.terminalFailure = nil
+            if operations[id]?.items[itemIndex].receipt?.backupURL != nil {
+                try issueReplaceRecoveryActions(id: id, itemIndex: itemIndex)
+                try transitionItem(id: id, index: itemIndex, to: .recoveryRequired)
+                try transitionOperation(id: id, to: .recoveryRequired)
+                markRecoveryRequired(.unexplainedFilesystemEffect(id))
+                return
+            }
+            try transitionItem(id: id, index: itemIndex, to: .completed)
+            try finishOrAdvance(id: id)
+            return
+        }
         let context = executionContext(operation: operation, itemIndex: itemIndex)
         if operation.state != .cleaningSource {
             let inspection = await dependencies.executor.inspectSourceBeforeCleanup(
@@ -2072,6 +3371,253 @@ private extension FileOperationService {
                 id: id, itemIndex: index, effect: effect,
                 actionID: actionID, invocationID: invocationID, receipt: receipt
             )
+        }
+    }
+
+    func recoverDurableCommittedEffects(
+        id: OperationID,
+        action: RecoveryAction,
+        projectionEffect: ExecutionRecoveryEffect,
+        actionID: UUID,
+        invocationID: UUID
+    ) async throws {
+        guard let operation = operations[id], !operation.committedEffects.isEmpty else {
+            throw FileOperationFailure(
+                code: .controlRejected,
+                operationID: id,
+                diagnostic: "durable recovery requires a committed receipt",
+                retryable: false
+            )
+        }
+        for (index, item) in operation.items.enumerated()
+        where operation.committedEffects[item.id] != nil {
+            try await recoverDurableItemEffects(
+                id: id,
+                itemIndex: index,
+                action: action,
+                projectionEffect: projectionEffect,
+                actionID: actionID,
+                invocationID: invocationID
+            )
+        }
+    }
+
+    func recoverDurableItemEffects(
+        id: OperationID,
+        itemIndex: Int,
+        action: RecoveryAction,
+        projectionEffect: ExecutionRecoveryEffect,
+        actionID: UUID,
+        invocationID: UUID
+    ) async throws {
+        guard let operation = operations[id],
+              operation.items.indices.contains(itemIndex),
+              let journal = dependencies.journal as? any DurableEffectJournal,
+              let executor = dependencies.executor as? any DurableEffectExecutor else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: id,
+                diagnostic: "durable recovery dependencies are unavailable",
+                retryable: false
+            )
+        }
+        let item = operation.items[itemIndex]
+        try requireRecoveryLease(
+            id: id,
+            actionID: actionID,
+            invocationID: invocationID,
+            itemID: item.id
+        )
+        let context = executionContext(operation: operation, itemIndex: itemIndex)
+        let records = try journal.effectRecords(operationID: id)
+            .filter { $0.intent.itemID == item.id }
+        let manifest = try journal.manifest(operationID: id, itemID: item.id)
+        let preparations = try await executor.prepareRecoveryEffects(
+            for: action,
+            context: context,
+            receipt: operation.committedEffects[item.id],
+            records: records,
+            manifest: manifest
+        )
+        let outcome = await performDurablePhase(
+            .commit,
+            context: context,
+            plan: ExecutionPlan(sourceDisposition: .noCleanup),
+            journal: journal,
+            executor: executor,
+            finalizePhase: false,
+            preparedEffects: preparations,
+            actionID: actionID
+        )
+        switch outcome {
+        case .sourceCleaned:
+            let completed = try journal.effectRecords(operationID: id)
+                .filter {
+                    $0.intent.itemID == item.id &&
+                        $0.result?.status == .completed
+                }
+            let matching = preparations.compactMap { preparation in
+                completed.last {
+                    $0.intent.kind == preparation.kind &&
+                        $0.intent.nodeID == preparation.nodeID &&
+                        $0.intent.relativePath == preparation.relativePath &&
+                        $0.intent.expectedIdentity == preparation.expectedIdentity &&
+                        $0.intent.manifestDigest == preparation.manifestDigest
+                }
+            }
+            guard matching.count == preparations.count,
+                  let effectID = matching.last?.intent.effectID else {
+                throw FileOperationFailure(
+                    code: .recoveryRequired,
+                    operationID: id,
+                    itemID: item.id,
+                    diagnostic: "durable recovery effect chain did not converge",
+                    retryable: false
+                )
+            }
+            try persistRecoveryAttempt(
+                id: id,
+                actionID: actionID,
+                itemID: item.id,
+                attempt: RecoveryEffectAttempt(
+                    effectID: effectID,
+                    effect: projectionEffect,
+                    result: .completed
+                )
+            )
+        case let .failed(failure), let .recoveryRequired(failure):
+            throw failure
+        default:
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: id,
+                itemID: item.id,
+                diagnostic: "unexpected durable recovery outcome",
+                retryable: false
+            )
+        }
+        try requireRecoveryLease(
+            id: id,
+            actionID: actionID,
+            invocationID: invocationID,
+            itemID: item.id
+        )
+    }
+
+    func resumeDurableCommit(
+        id: OperationID,
+        itemIndex: Int,
+        action: RecoveryAction,
+        actionID: UUID,
+        invocationID: UUID
+    ) async throws {
+        guard let operation = operations[id],
+              operation.items.indices.contains(itemIndex),
+              let journal = dependencies.journal as? any DurableEffectJournal,
+              let executor = dependencies.executor as? any DurableEffectExecutor else {
+            throw FileOperationFailure(
+                code: .invariantViolation,
+                operationID: id,
+                diagnostic: "durable resume dependencies are unavailable",
+                retryable: false
+            )
+        }
+        let item = operation.items[itemIndex]
+        let context = executionContext(operation: operation, itemIndex: itemIndex)
+        let records = try journal.effectRecords(operationID: id)
+            .filter { $0.intent.itemID == item.id }
+        let manifest = try journal.manifest(operationID: id, itemID: item.id)
+        let preparations = try await executor.prepareRecoveryEffects(
+            for: action,
+            context: context,
+            receipt: operation.committedEffects[item.id],
+            records: records,
+            manifest: manifest
+        )
+        if operations[id]?.items[itemIndex].state == .verifying {
+            try transitionItem(id: id, index: itemIndex, to: .committing)
+        }
+        if operations[id]?.state == .verifying {
+            try transitionOperation(id: id, to: .committing)
+        }
+        guard operations[id]?.items[itemIndex].state == .committing,
+              operations[id]?.state == .committing else {
+            throw FileOperationFailure(
+                code: .controlRejected,
+                operationID: id,
+                itemID: item.id,
+                diagnostic: "durable resume requires a verified or committing projection",
+                retryable: false
+            )
+        }
+        let resumed = await performDurablePhase(
+            .commit,
+            context: context,
+            plan: ExecutionPlan(sourceDisposition: .noCleanup),
+            journal: journal,
+            executor: executor,
+            finalizePhase: true,
+            preparedEffects: preparations,
+            actionID: actionID
+        )
+        try requireRecoveryLease(
+            id: id,
+            actionID: actionID,
+            invocationID: invocationID,
+            itemID: item.id
+        )
+        guard case let .committed(receipt) = resumed else {
+            if case let .failed(failure) = resumed { throw failure }
+            if case let .recoveryRequired(failure) = resumed { throw failure }
+            throw FileOperationFailure(
+                code: .recoveryRequired,
+                operationID: id,
+                itemID: item.id,
+                diagnostic: "durable commit resume did not produce a receipt",
+                retryable: false
+            )
+        }
+        if operations[id]?.items[itemIndex].receipt != receipt ||
+            operations[id]?.committedEffects[item.id] != receipt {
+            try recordReceipt(id: id, itemIndex: itemIndex, receipt: receipt)
+        }
+        try transitionItem(id: id, index: itemIndex, to: .committed)
+        if receipt.backupURL != nil {
+            try transitionItem(id: id, index: itemIndex, to: .recoveryRequired)
+            try transitionOperation(id: id, to: .recoveryRequired)
+            markRecoveryRequired(.unexplainedFilesystemEffect(id))
+        } else if receipt.sourceCleanupPending {
+            try transitionItem(id: id, index: itemIndex, to: .committedAwaitingCleanup)
+            try transitionOperation(id: id, to: .committedAwaitingCleanup)
+            markRecoveryRequired(.unexplainedFilesystemEffect(id))
+        } else {
+            try transitionItem(id: id, index: itemIndex, to: .completed)
+            try finishOrAdvance(id: id)
+        }
+    }
+
+    /// A resume action must remain the sole durable capability until its
+    /// command is completed. Only then may cleanup or replace disposition
+    /// capabilities be issued for the next recovery state.
+    func issuePostResumeRecoveryActions(id: OperationID) throws {
+        guard let operation = operations[id] else { return }
+        for (index, item) in operation.items.enumerated() {
+            guard let receipt = item.receipt else { continue }
+            if receipt.backupURL != nil, item.state == .recoveryRequired {
+                try issueReplaceRecoveryActions(id: id, itemIndex: index)
+                markRecoveryRequired(.unexplainedFilesystemEffect(id))
+                return
+            }
+            if receipt.sourceCleanupPending,
+               item.state == .committedAwaitingCleanup {
+                try issueCleanupRecoveryActions(
+                    id: id,
+                    itemIndex: index,
+                    allowRetain: true
+                )
+                markRecoveryRequired(.unexplainedFilesystemEffect(id))
+                return
+            }
         }
     }
 
@@ -2350,9 +3896,18 @@ private extension FileOperationService {
               operation.inProgressRecoveryActions == [actionID],
               operation.availableActions.count == 1,
               operation.availableActions.first?.command.actionID == actionID else {
+            let operation = operations[id]
             throw FileOperationFailure(
                 code: .controlRejected, operationID: id, itemID: itemID,
-                diagnostic: "recovery invocation lost its exclusive lease",
+                diagnostic: """
+                recovery invocation lost its exclusive lease \
+                active=\(String(describing: activeID)) \
+                lease=\(String(describing: recoveryLeases[id])) \
+                inProgress=\(String(describing: operation?.inProgressRecoveryActions)) \
+                available=\(String(describing: operation?.availableActions.map {
+                    $0.command.actionID
+                }))
+                """,
                 retryable: false
             )
         }
@@ -3085,6 +4640,12 @@ private extension FileOperationService {
         for operation in operations.values {
             if !operation.inProgressRecoveryActions.isEmpty {
                 reasons.insert(.durableCommand(operation.id))
+            }
+            // Destructive/ambiguous recovery capabilities are exclusive and
+            // block normal scheduling. A lone failed-attempt resume capability
+            // deliberately remains compatible with tokenless retry.
+            if operation.hasExclusiveRecoveryCapabilities {
+                reasons.insert(.unexplainedFilesystemEffect(operation.id))
             }
             if operation.hasUnresolvedRecoveryEffects {
                 reasons.insert(.unresolvedEffect(operation.id))

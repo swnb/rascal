@@ -14,7 +14,10 @@ let package = Package(
             name: "RascalFileOperations",
             path: "Sources/RascalFileOperations",
             exclude: ["TestSupport"],
-            sources: ["Core", "Interfaces", "Native", "Copy"]
+            sources: ["Core", "Interfaces", "Native", "Copy", "Journal", "Move", "Replace", "Recovery"],
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
         ),
         // Test support is deliberately not a product and is never linked by FinderTwo.
         .target(

@@ -938,22 +938,10 @@ final class RecoverySafetyTests: XCTestCase {
         }
     }
 
-    func testRecoveryModeGuardsAllControlsWithoutMutatingSiblingOperations() async throws {
+    func testRecoveryModeGuardsAllControlsAndRejectsSiblingAdmission() async throws {
         let journal = InMemoryOperationJournal()
-        let executor = FakeOperationExecutor()
-        await executor.setModeSequence([.failed(.noSpace), .ambiguous], for: .copy)
+        let executor = FakeOperationExecutor(modes: [.copy: .ambiguous])
         let harness = try ServiceTestHarness(journal: journal, executor: executor)
-        let failedID = try await harness.service.submit(copyRequest("/source/control-failed"))
-        // A failed pre-commit attempt first exposes discardKnownStaging, then
-        // durably converges that cleanup into a sequence-bound resume action.
-        // Capture the settled projection so this test isolates the guarded
-        // controls instead of racing the legitimate convergence event.
-        let failedBefore = try await waitForRecoveryAction(
-            id: failedID, service: harness.service
-        ) {
-            if case .resumeFromVerifiedStage = $0 { return true }
-            return false
-        }
         let recoveryID = try await harness.service.submit(copyRequest("/source/control-recovery"))
         let recoveryBefore = try await waitForState(
             .recoveryRequired, id: recoveryID, service: harness.service
@@ -962,30 +950,28 @@ final class RecoverySafetyTests: XCTestCase {
             if case .rollbackCommittedDestination = $0 { return true }
             return false
         })
-        let failedEvents = journal.eventCount(operationID: failedID)
         let recoveryEvents = journal.eventCount(operationID: recoveryID)
         let startsBefore = await executor.startedOperations()
 
+        await assertFailure(.serviceSafeMode) {
+            _ = try await harness.service.submit(
+                copyRequest("/source/recovery-mode-sibling")
+            )
+        }
         await assertFailure(.serviceSafeMode) {
             try await harness.service.resolve(
                 DecisionToken(rawValue: UUID()), with: .skip(scope: .item)
             )
         }
         await assertFailure(.serviceSafeMode) {
-            try await harness.service.retry(failedID)
+            try await harness.service.retry(recoveryID)
         }
-        await harness.service.pause(failedID)
-        await harness.service.resume(failedID)
-        await harness.service.cancel(failedID)
         await harness.service.pause(recoveryID)
         await harness.service.resume(recoveryID)
         await harness.service.cancel(recoveryID)
 
-        let failedAfter = try await harness.service.snapshot(failedID)
         let recoveryAfter = try await harness.service.snapshot(recoveryID)
-        assertDurableSnapshotUnchanged(failedBefore, failedAfter)
         assertDurableSnapshotUnchanged(recoveryBefore, recoveryAfter)
-        XCTAssertEqual(journal.eventCount(operationID: failedID), failedEvents)
         XCTAssertEqual(journal.eventCount(operationID: recoveryID), recoveryEvents)
         let startsAfter = await executor.startedOperations()
         XCTAssertEqual(startsAfter, startsBefore)
